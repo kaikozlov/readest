@@ -2,8 +2,8 @@ local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local socketutil = require("socketutil")
 
--- Sync operation timeouts
-local SYNC_TIMEOUTS = { 5, 10 }
+-- Sync operation timeouts (connect, total)
+local SYNC_TIMEOUTS = { 10, 30 }
 
 local ReadestSyncClient = {
     service_spec = nil,

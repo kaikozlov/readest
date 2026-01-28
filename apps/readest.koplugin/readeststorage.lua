@@ -2,7 +2,8 @@ local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local socketutil = require("socketutil")
 
-local STORAGE_TIMEOUTS = { 10, 30 }
+-- Storage operation timeouts (connect, total)
+local STORAGE_TIMEOUTS = { 15, 60 }
 
 local ReadestStorageClient = {
     service_spec = nil,
