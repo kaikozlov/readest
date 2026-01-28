@@ -328,7 +328,7 @@ function ReadestSync:getBookMetadataFromFile(file_path, doc_settings)
 
     return {
         userId = self.settings.user_id,
-        bookHash = book_hash,
+        hash = book_hash,
         metaHash = meta_hash,
         format = doc_props.document_format or "unknown",
         title = doc_props.title or "",
