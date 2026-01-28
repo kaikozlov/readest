@@ -271,7 +271,7 @@ function ReadestSync:getBookMetadataFromFile(file_path, doc_settings)
     if not meta_hash then
         local title = doc_props.title or ""
         if title == "" then
-            local _, filename = util.splitFilePathName(file_path)
+            local dir, filename = util.splitFilePathName(file_path)
             local basename, _ = util.splitFileNameSuffix(filename)
             title = basename or ""
         end
@@ -631,7 +631,7 @@ function ReadestSync:uploadSelectedBooks(selections)
         local file_size = file:seek("end")
         file:close()
 
-        local _, filename = util.splitFilePathName(selection.filepath)
+        local dir, filename = util.splitFilePathName(selection.filepath)
 
         -- Request upload URL
         client:requestUpload({
