@@ -493,7 +493,16 @@ function ReadestSync:syncAllBooks(interactive)
                 self.settings.last_sync_at = os.time()
                 G_reader_settings:saveSetting("readest_sync", self.settings)
             else
-                UIManager:show(InfoMessage:new{ text = _("Sync failed"), timeout = 2 })
+                local error_msg = _("Sync failed")
+                if response then
+                    if type(response) == "table" then
+                        error_msg = error_msg .. ": " .. (response.error or response.message or "Unknown error")
+                    elseif type(response) == "string" then
+                        error_msg = error_msg .. ": " .. response
+                    end
+                end
+                logger.err("ReadestSync: syncAllBooks failed:", response)
+                UIManager:show(InfoMessage:new{ text = error_msg, timeout = 3 })
             end
         end
     end)
@@ -630,9 +639,10 @@ function ReadestSync:uploadSelectedBooks(selections)
             fileSize = file_size,
             bookHash = book_hash,
         }, function(success, response)
-            if success and response.uploadUrl then
+            if success and response and (response.uploadUrl or response.upload_url) then
                 -- Upload file directly to storage
-                client:uploadFileToUrl(response.uploadUrl, selection.filepath, function(upload_ok, upload_res)
+                local upload_url = response.uploadUrl or response.upload_url
+                client:uploadFileToUrl(upload_url, selection.filepath, function(upload_ok, upload_res)
                     if upload_ok then
                         success_count = success_count + 1
                         logger.dbg("ReadestSync: Uploaded:", selection.filepath)
@@ -644,7 +654,11 @@ function ReadestSync:uploadSelectedBooks(selections)
                 end)
             else
                 fail_count = fail_count + 1
-                logger.err("ReadestSync: Failed to get upload URL:", response)
+                local error_info = response
+                if type(response) == "table" then
+                    error_info = response.error or response.message or "Unknown error"
+                end
+                logger.err("ReadestSync: Failed to get upload URL:", error_info)
                 UIManager:scheduleIn(0.1, uploadNext)
             end
         end)
@@ -675,7 +689,16 @@ function ReadestSync:showDownloadBookList()
 
     client:listFiles({ limit = 100 }, function(success, response)
         if not success then
-            UIManager:show(InfoMessage:new{ text = _("Failed to fetch book list"), timeout = 2 })
+            local error_msg = _("Failed to fetch book list")
+            if response then
+                if type(response) == "table" then
+                    error_msg = error_msg .. ": " .. (response.error or response.message or "Unknown error")
+                elseif type(response) == "string" then
+                    error_msg = error_msg .. ": " .. response
+                end
+            end
+            logger.err("ReadestSync: listFiles failed:", response)
+            UIManager:show(InfoMessage:new{ text = error_msg, timeout = 3 })
             return
         end
 
@@ -697,7 +720,12 @@ function ReadestSync:showDownloadSelection(files)
     local file_table = {}
     for _, file in ipairs(files) do
         local fileKey = file.file_key or file.fileKey
-        local fileName = file.file_name or file.fileName or fileKey:match("/([^/]+)$")
+        if not fileKey then
+            logger.warn("ReadestSync: Skipping file without file_key:", file)
+            goto continue
+        end
+
+        local fileName = file.file_name or file.fileName or fileKey:match("/([^/]+)$") or "unknown"
         local fileSize = file.file_size or file.fileSize or 0
         local bookHash = file.book_hash or file.bookHash
 
@@ -736,6 +764,7 @@ function ReadestSync:showDownloadSelection(files)
             local_hash = local_hash,
             local_path = local_path,
         })
+        ::continue::
     end
 
     local menu = Menu:new{
@@ -874,11 +903,12 @@ function ReadestSync:downloadBooks(selections, download_dir, client)
 
         -- Request download URL
         client:requestDownload(selection.file_key, function(success, response)
-            if success and response.downloadUrl then
+            if success and response and (response.downloadUrl or response.download_url) then
+                local download_url = response.downloadUrl or response.download_url
                 local dest_path = download_dir .. "/" .. selection.file_name
 
                 -- Download file
-                client:downloadFileFromUrl(response.downloadUrl, dest_path, function(download_ok, download_res)
+                client:downloadFileFromUrl(download_url, dest_path, function(download_ok, download_res)
                     if download_ok then
                         success_count = success_count + 1
                         logger.dbg("ReadestSync: Downloaded:", selection.file_name)
@@ -1052,7 +1082,16 @@ function ReadestSync:showDeleteBookList()
 
     client:listFiles({ limit = 100 }, function(success, response)
         if not success then
-            UIManager:show(InfoMessage:new{ text = _("Failed to fetch book list"), timeout = 2 })
+            local error_msg = _("Failed to fetch book list")
+            if response then
+                if type(response) == "table" then
+                    error_msg = error_msg .. ": " .. (response.error or response.message or "Unknown error")
+                elseif type(response) == "string" then
+                    error_msg = error_msg .. ": " .. response
+                end
+            end
+            logger.err("ReadestSync: listFiles failed:", response)
+            UIManager:show(InfoMessage:new{ text = error_msg, timeout = 3 })
             return
         end
 
@@ -1073,7 +1112,12 @@ function ReadestSync:showDeleteSelection(files)
     local file_table = {}
     for _, file in ipairs(files) do
         local fileKey = file.file_key or file.fileKey
-        local fileName = file.file_name or file.fileName or fileKey:match("/([^/]+)$")
+        if not fileKey then
+            logger.warn("ReadestSync: Skipping file without file_key:", file)
+            goto continue
+        end
+
+        local fileName = file.file_name or file.fileName or fileKey:match("/([^/]+)$") or "unknown"
         local fileSize = file.file_size or file.fileSize or 0
         local size_mb = string.format("%.2f MB", fileSize / (1024 * 1024))
 
@@ -1082,6 +1126,7 @@ function ReadestSync:showDeleteSelection(files)
             file_key = fileKey,
             file_name = fileName,
         })
+        ::continue::
     end
 
     local menu = Menu:new{

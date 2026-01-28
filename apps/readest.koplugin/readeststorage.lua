@@ -200,7 +200,6 @@ function ReadestStorageClient:uploadFileToUrl(uploadUrl, filePath, callback)
     -- Use socket.http for direct upload to storage
     local http = require("socket.http")
     local ltn12 = require("ltn12")
-    local mime = require("mime")
 
     local file = io.open(filePath, "rb")
     if not file then
@@ -211,22 +210,23 @@ function ReadestStorageClient:uploadFileToUrl(uploadUrl, filePath, callback)
     local file_content = file:read("*all")
     file:close()
 
-    local body, err = mime.encode(file_content, "binary")
-    if not body then
-        callback(false, {error = err})
+    local ok, result, code = pcall(function()
+        return http.request{
+            url = uploadUrl,
+            method = "PUT",
+            headers = {
+                ["Content-Type"] = "application/octet-stream",
+                ["Content-Length"] = #file_content,
+            },
+            source = ltn12.source.string(file_content),
+            sink = ltn12.sink.table({})
+        }
+    end)
+
+    if not ok then
+        callback(false, {error = "HTTP request failed: " .. tostring(result)})
         return
     end
-
-    local result, code = http.request{
-        url = uploadUrl,
-        method = "PUT",
-        headers = {
-            ["Content-Type"] = "application/octet-stream",
-            ["Content-Length"] = #file_content,
-        },
-        source = ltn12.source.string(file_content),
-        sink = ltn12.sink.table({})
-    }
 
     callback(code == 200, {status = code})
 end
@@ -241,13 +241,21 @@ function ReadestStorageClient:downloadFileFromUrl(downloadUrl, filePath, callbac
         return
     end
 
-    local result, code = http.request{
-        url = downloadUrl,
-        method = "GET",
-        sink = ltn12.sink.file(file)
-    }
+    local ok, result, code = pcall(function()
+        return http.request{
+            url = downloadUrl,
+            method = "GET",
+            sink = ltn12.sink.file(file)
+        }
+    end)
 
     file:close()
+
+    if not ok then
+        os.remove(filePath) -- Clean up partial download
+        callback(false, {error = "HTTP request failed: " .. tostring(result)})
+        return
+    end
 
     if code == 200 then
         callback(true, {path = filePath})
