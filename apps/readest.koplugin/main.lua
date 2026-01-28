@@ -327,21 +327,21 @@ function ReadestSync:getBookMetadataFromFile(file_path, doc_settings)
     else status = "reading" end
 
     return {
-        userId = self.settings.user_id,
-        bookHash = book_hash,
-        metaHash = meta_hash,
+        user_id = self.settings.user_id,
+        book_hash = book_hash,
+        meta_hash = meta_hash,
         format = doc_props.document_format or "unknown",
         title = doc_props.title or "",
         author = author_list[1] or "",
-        groupId = nil,
-        groupName = nil,
+        group_id = nil,
+        group_name = nil,
         tags = {},
         progress = nil,
-        readingStatus = status,
+        reading_status = status,
         metadata = nil,
-        createdAt = nil,
-        updatedAt = os.time() * 1000,
-        deletedAt = nil
+        created_at = nil,
+        updated_at = os.time() * 1000,
+        deleted_at = nil
     }
 end
 
@@ -397,9 +397,9 @@ function ReadestSync:getAnnotationsFromDocSettings(doc_settings, book_hash, meta
             end
 
             table.insert(notes, {
-                userId = self.settings.user_id,
-                bookHash = book_hash,
-                metaHash = meta_hash,
+                user_id = self.settings.user_id,
+                book_hash = book_hash,
+                meta_hash = meta_hash,
                 id = self:generateNoteId(annotation),
                 type = note_type,
                 cfi = annotation.page,
@@ -407,8 +407,8 @@ function ReadestSync:getAnnotationsFromDocSettings(doc_settings, book_hash, meta
                 style = annotation.drawer or "highlight",
                 color = color or "#FFFF00",
                 note = annotation.note or "",
-                updatedAt = updated_at,
-                deletedAt = nil
+                updated_at = updated_at,
+                deleted_at = nil
             })
         end
     end
@@ -482,6 +482,8 @@ function ReadestSync:syncAllBooks(interactive)
     self:tryRefreshToken()
 
     local payload = { books = books, notes = all_notes, configs = all_configs }
+
+    logger.dbg("ReadestSync: Sending sync payload with", #books, "books,", #all_notes, "notes,", #all_configs, "configs")
 
     client:pushChanges(payload, function(success, response)
         if interactive then
@@ -1579,9 +1581,9 @@ function ReadestSync:getCurrentBookNotes()
         end
 
         table.insert(notes, {
-            userId = self.settings.user_id,
-            bookHash = book_hash,
-            metaHash = meta_hash,
+            user_id = self.settings.user_id,
+            book_hash = book_hash,
+            meta_hash = meta_hash,
             id = self:generateNoteId(annotation),
             type = note_type,
             cfi = annotation.page,
@@ -1589,8 +1591,8 @@ function ReadestSync:getCurrentBookNotes()
             style = annotation.drawer or "highlight",
             color = color or "#FFFF00",
             note = annotation.note or "",
-            updatedAt = updated_at,
-            deletedAt = nil
+            updated_at = updated_at,
+            deleted_at = nil
         })
         ::continue::
     end
@@ -1617,7 +1619,7 @@ function ReadestSync:applyNotesToBook(notes)
             end
         end
 
-        if not exists and remote_note.deletedAt == nil then
+        if not exists and remote_note.deleted_at == nil then
             -- Parse color back to KOReader format
             local color = remote_note.color
             if color:match("#%x%x%x%x%x%x") then
@@ -1628,7 +1630,7 @@ function ReadestSync:applyNotesToBook(notes)
             end
 
             table.insert(notes_to_add, {
-                datetime = remote_note.updatedAt / 1000,
+                datetime = remote_note.updated_at / 1000,
                 datetime_updated = nil,
                 drawer = remote_note.style,
                 color = color,
