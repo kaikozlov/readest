@@ -35,6 +35,9 @@ ReadestSync.default_settings = {
     expires_at = nil,
     expires_in = nil,
     last_sync_at = nil,
+    sync_queue = {},
+    storage_usage = nil,
+    storage_quota = nil,
 }
 
 function ReadestSync:init()
@@ -65,7 +68,22 @@ end
 function ReadestSync:addToMainMenu(menu_items)
     menu_items.readest_sync = {
         sorting_hint = "tools",
-        text = _("Readest Sync"),
+        text_func = function()
+            local status = _("Readest Sync")
+            if self:needsLogin() then
+                return status .. " (" .. _("Not logged in") .. ")"
+            elseif #self.settings.sync_queue > 0 then
+                return status .. " (" .. T(_("%1 pending"), #self.settings.sync_queue) .. ")"
+            elseif self.settings.storage_usage and self.settings.storage_quota then
+                local usage_pct = math.floor((self.settings.storage_usage / self.settings.storage_quota) * 100)
+                return status .. " (" .. T(_("%1%% used"), usage_pct) .. ")"
+            elseif self.settings.last_sync_at then
+                local time_str = os.date("%H:%M", self.settings.last_sync_at)
+                return status .. " (" .. T(_("Last: %1"), time_str) .. ")"
+            else
+                return status
+            end
+        end,
         sub_item_table = {
             {
                 text_func = function()
@@ -127,6 +145,42 @@ function ReadestSync:addToMainMenu(menu_items)
                 text = _("Download books from storage"),
                 enabled_func = function() return self.settings.access_token ~= nil end,
                 callback = function() self:showDownloadBookList() end,
+            },
+            {
+                text = _("Storage statistics"),
+                enabled_func = function() return self.settings.access_token ~= nil end,
+                callback = function() self:showStorageStats() end,
+            },
+            {
+                text = _("Delete books from storage"),
+                enabled_func = function() return self.settings.access_token ~= nil end,
+                callback = function() self:showDeleteBookList() end,
+            },
+            {
+                text = _("View sync queue"),
+                enabled_func = function() return #self.settings.sync_queue > 0 end,
+                callback = function()
+                    local queue = self.settings.sync_queue
+                    if #queue == 0 then
+                        UIManager:show(InfoMessage:new{
+                            text = _("Sync queue is empty"),
+                            timeout = 2,
+                        })
+                        return
+                    end
+
+                    local text = T(_("%1 items pending sync:"), #queue) .. "\n\n"
+                    for i, item in ipairs(queue) do
+                        local time_str = os.date("%H:%M:%S", item.timestamp)
+                        text = text .. string.format("%d. [%s] %s (retries: %d)\n",
+                            i, time_str, item.type, item.retries)
+                    end
+
+                    UIManager:show(InfoMessage:new{
+                        text = text,
+                        timeout = 5,
+                    })
+                end,
             },
         }
     }
@@ -839,6 +893,346 @@ function ReadestSync:downloadBooks(selections, download_dir, client)
     downloadNext()
 end
 
+function ReadestSync:extractCoverImage(doc_settings)
+    -- Get cover from KOReader's cache
+    local doc_props = doc_settings:readSetting("doc_props")
+    if not doc_props then return nil end
+
+    local cover_file = doc_settings:readSetting("cover_file")
+    if not cover_file then
+        -- Try to extract cover from document
+        if self.ui and self.ui.document and self.ui.document.getCoverPageImage then
+            local ok, image = pcall(function()
+                return self.ui.document:getCoverPageImage()
+            end)
+            if ok and image then
+                -- Save to temp file
+                local temp_dir = os.getenv("TMPDIR") or "/tmp"
+                local temp_cover = temp_dir .. "/readest_cover_" .. os.time() .. ".png"
+                local gd = require("gd")
+                local gd_img = gd.fromImage(image)
+                if gd_img then
+                    gd_img:png(temp_cover)
+                    return temp_cover
+                end
+            end
+        end
+        return nil
+    end
+
+    return cover_file
+end
+
+function ReadestSync:uploadCoverForBook(book_hash, doc_settings)
+    local client = self:getReadestStorageClient()
+    if not client then return end
+
+    local cover_path = self:extractCoverImage(doc_settings)
+    if not cover_path or not util.pathExists(cover_path) then
+        logger.dbg("ReadestSync: No cover found for book:", book_hash)
+        return
+    end
+
+    local file = io.open(cover_path, "rb")
+    if not file then return end
+
+    local file_size = file:seek("end")
+    file:close()
+
+    local filename = "cover_" .. book_hash .. ".png"
+
+    client:requestUpload({
+        fileName = filename,
+        fileSize = file_size,
+        bookHash = book_hash,
+        temp = false,
+    }, function(success, response)
+        if success and response.uploadUrl then
+            client:uploadFileToUrl(response.uploadUrl, cover_path, function(upload_ok)
+                if upload_ok then
+                    logger.dbg("ReadestSync: Uploaded cover for:", book_hash)
+                else
+                    logger.err("ReadestSync: Failed to upload cover:", book_hash)
+                end
+                -- Clean up temp file
+                if cover_path:find("/tmp/") then
+                    os.remove(cover_path)
+                end
+            end)
+        end
+    end)
+end
+
+function ReadestSync:showStorageStats()
+    if not self.settings.access_token then
+        UIManager:show(InfoMessage:new{ text = _("Please login first"), timeout = 2 })
+        return
+    end
+
+    if NetworkMgr:willRerunWhenOnline(function() self:showStorageStats() end) then
+        return
+    end
+
+    UIManager:show(InfoMessage:new{ text = _("Fetching storage stats..."), timeout = 1 })
+
+    local client = self:getReadestStorageClient()
+    if not client then
+        UIManager:show(InfoMessage:new{ text = _("Failed to get storage client"), timeout = 2 })
+        return
+    end
+
+    self:tryRefreshToken()
+
+    client:getStats(function(success, response)
+        if not success then
+            UIManager:show(InfoMessage:new{ text = _("Failed to fetch storage stats"), timeout = 2 })
+            return
+        end
+
+        local totalFiles = response.totalFiles or 0
+        local totalSize = response.totalSize or 0
+        local usage = response.usage or 0
+        local quota = response.quota or 0
+        local percentage = response.usagePercentage or 0
+
+        -- Save stats to settings
+        self.settings.storage_usage = usage
+        self.settings.storage_quota = quota
+        G_reader_settings:saveSetting("readest_sync", self.settings)
+
+        local size_mb = string.format("%.2f MB", totalSize / (1024 * 1024))
+        local quota_mb = string.format("%.2f MB", quota / (1024 * 1024))
+        local usage_mb = string.format("%.2f MB", usage / (1024 * 1024))
+        local pct_str = string.format("%.1f%%", percentage * 100)
+
+        local text = T(_("Storage Statistics\n\n") ..
+                       _("Total files: %1\n") ..
+                       _("Total size: %2\n") ..
+                       _("Storage used: %3 of %4 (%5)"),
+                       totalFiles, size_mb, usage_mb, quota_mb, pct_str)
+
+        UIManager:show(InfoMessage:new{
+            text = text,
+            timeout = 5,
+        })
+    end)
+end
+
+function ReadestSync:showDeleteBookList()
+    if not self.settings.access_token then
+        UIManager:show(InfoMessage:new{ text = _("Please login first"), timeout = 2 })
+        return
+    end
+
+    if NetworkMgr:willRerunWhenOnline(function() self:showDeleteBookList() end) then
+        return
+    end
+
+    UIManager:show(InfoMessage:new{ text = _("Fetching book list..."), timeout = 1 })
+
+    local client = self:getReadestStorageClient()
+    if not client then
+        UIManager:show(InfoMessage:new{ text = _("Failed to get storage client"), timeout = 2 })
+        return
+    end
+
+    self:tryRefreshToken()
+
+    client:listFiles({ limit = 100 }, function(success, response)
+        if not success then
+            UIManager:show(InfoMessage:new{ text = _("Failed to fetch book list"), timeout = 2 })
+            return
+        end
+
+        local files = response.files or response.data or {}
+        if #files == 0 then
+            UIManager:show(InfoMessage:new{ text = _("No books found in storage"), timeout = 2 })
+            return
+        end
+
+        self:showDeleteSelection(files)
+    end)
+end
+
+function ReadestSync:showDeleteSelection(files)
+    local Menu = require("ui/widget/menu")
+
+    -- Build file list
+    local file_table = {}
+    for _, file in ipairs(files) do
+        local fileKey = file.file_key or file.fileKey
+        local fileName = file.file_name or file.fileName or fileKey:match("/([^/]+)$")
+        local fileSize = file.file_size or file.fileSize or 0
+        local size_mb = string.format("%.2f MB", fileSize / (1024 * 1024))
+
+        table.insert(file_table, {
+            text = fileName .. " (" .. size_mb .. ")",
+            file_key = fileKey,
+            file_name = fileName,
+        })
+    end
+
+    local menu = Menu:new{
+        title = _("Select books to delete from storage"),
+        item_table = file_table,
+        is_borderless = true,
+        is_popout = false,
+        select_mode = "multi",
+        callback = function()
+            local selected = menu:getMultiSelection()
+            if #selected > 0 then
+                UIManager:close(menu)
+                self:confirmDeleteBooks(selected)
+            end
+        end,
+        close_callback = function()
+            UIManager:close(menu)
+        end
+    }
+    UIManager:show(menu)
+end
+
+function ReadestSync:confirmDeleteBooks(selections)
+    local ConfirmWidget = require("ui/widget/confirmbox")
+
+    UIManager:show(ConfirmWidget:new{
+        text = T(_("Are you sure you want to delete %1 books from storage?\n\nThis action cannot be undone."), #selections),
+        ok_text = _("Delete"),
+        cancel_text = _("Cancel"),
+        ok_callback = function()
+            self:deleteSelectedBooks(selections)
+        end
+    })
+end
+
+function ReadestSync:deleteSelectedBooks(selections)
+    UIManager:show(InfoMessage:new{
+        text = T(_("Deleting %1 books..."), #selections),
+        timeout = 1,
+    })
+
+    local client = self:getReadestStorageClient()
+    if not client then
+        UIManager:show(InfoMessage:new{ text = _("Failed to get storage client"), timeout = 2 })
+        return
+    end
+
+    local index = 0
+    local success_count = 0
+    local fail_count = 0
+
+    local function deleteNext()
+        index = index + 1
+        if index > #selections then
+            UIManager:show(InfoMessage:new{
+                text = T(_("Delete complete: %1 succeeded, %2 failed"), success_count, fail_count),
+                timeout = 3,
+            })
+            return
+        end
+
+        local selection = selections[index]
+
+        UIManager:show(InfoMessage:new{
+            text = T(_("Deleting %1 of %2..."), index, #selections),
+            timeout = 1,
+        })
+
+        client:deleteFile(selection.file_key, function(success, response)
+            if success then
+                success_count = success_count + 1
+                logger.dbg("ReadestSync: Deleted:", selection.file_name)
+            else
+                fail_count = fail_count + 1
+                logger.err("ReadestSync: Delete failed:", selection.file_name, response)
+            end
+            UIManager:scheduleIn(0.1, deleteNext)
+        end)
+    end
+
+    deleteNext()
+end
+
+function ReadestSync:enqueueSync(type, data)
+    table.insert(self.settings.sync_queue, {
+        type = type,
+        data = data,
+        timestamp = os.time(),
+        retries = 0
+    })
+    G_reader_settings:saveSetting("readest_sync", self.settings)
+    logger.dbg("ReadestSync: Enqueued", type, "to sync queue")
+end
+
+function ReadestSync:processSyncQueue()
+    if not NetworkMgr:isConnected() then
+        return
+    end
+
+    if #self.settings.sync_queue == 0 then
+        return
+    end
+
+    local client = self:getReadestSyncClient()
+    if not client then
+        return
+    end
+
+    logger.dbg("ReadestSync: Processing sync queue, items:", #self.settings.sync_queue)
+
+    local queue = self.settings.sync_queue
+    local to_remove = {}
+
+    for i, item in ipairs(queue) do
+        if item.retries >= 3 then
+            table.insert(to_remove, i)
+            logger.warn("ReadestSync: Discarding queued sync after 3 retries")
+            goto continue
+        end
+
+        local success = false
+        if item.type == "push" then
+            client:pushChanges(item.data, function(s, r)
+                success = s
+                if not s then
+                    item.retries = item.retries + 1
+                    logger.dbg("ReadestSync: Queue push failed, retry", item.retries)
+                end
+            end)
+        elseif item.type == "pull" then
+            -- Handle queued pull
+            client:pullChanges(item.data.params, function(s, r)
+                success = s
+                if s and item.data.onSuccess then
+                    item.data.onSuccess(r)
+                end
+                if not s then
+                    item.retries = item.retries + 1
+                end
+            end)
+        end
+
+        if success then
+            table.insert(to_remove, i)
+        end
+
+        ::continue::
+    end
+
+    -- Remove processed items (in reverse order)
+    for i = #to_remove, 1, -1 do
+        table.remove(self.settings.sync_queue, to_remove[i])
+    end
+
+    G_reader_settings:saveSetting("readest_sync", self.settings)
+end
+
+function ReadestSync:onNetworkConnected()
+    UIManager:nextTick(function()
+        self:processSyncQueue()
+    end)
+end
+
 function ReadestSync:login(menu)
     if NetworkMgr:willRerunWhenOnline(function() self:login(menu) end) then
         return
@@ -1300,6 +1694,8 @@ function ReadestSync:pushBookConfig(interactive)
             end
             if success then
                 self.last_sync_timestamp = os.time()
+            elseif not interactive then
+                self:enqueueSync("push", payload)
             end
         end
     )
@@ -1375,6 +1771,28 @@ function ReadestSync:pullBookConfig(interactive)
                     UIManager:show(InfoMessage:new{
                         text = _("Failed to pull book config"),
                         timeout = 2,
+                    })
+                else
+                    self:enqueueSync("pull", {
+                        params = {
+                            since = 0,
+                            type = "configs",
+                            book = book_hash,
+                            meta_hash = meta_hash,
+                        },
+                        onSuccess = function(response)
+                            local data = response.configs
+                            if data and #data > 0 then
+                                local config = data[1]
+                                if config then
+                                    self:applyBookConfig(config)
+                                end
+                            end
+                            local notes = response.notes
+                            if notes and #notes > 0 then
+                                self:applyNotesToBook(notes)
+                            end
+                        end
                     })
                 end
                 return
