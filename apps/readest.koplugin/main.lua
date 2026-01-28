@@ -263,7 +263,7 @@ function ReadestSync:getBookMetadataFromFile(file_path, doc_settings)
     if not doc_props then return nil end
 
     local book_hash = doc_settings:readSetting("partial_md5_checksum")
-    if not book_hash then return nil end
+    if not book_hash or book_hash == "" then return nil end
 
     -- Get or generate metadata hash
     local doc_readest_sync = doc_settings:readSetting("readest_sync") or {}
@@ -347,11 +347,11 @@ end
 
 function ReadestSync:getConfigFromDocSettings(doc_settings)
     local book_hash = doc_settings:readSetting("partial_md5_checksum")
-    if not book_hash then return nil end
+    if not book_hash or book_hash == "" then return nil end
 
     local doc_readest_sync = doc_settings:readSetting("readest_sync") or {}
     local meta_hash = doc_readest_sync.meta_hash_v1
-    if not meta_hash then return nil end
+    if not meta_hash or meta_hash == "" then return nil end
 
     local summary = doc_settings:readSetting("summary") or {}
     local config = {
