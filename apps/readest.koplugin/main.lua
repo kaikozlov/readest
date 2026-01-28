@@ -44,6 +44,18 @@ function ReadestSync:init()
     self.last_sync_timestamp = 0
     self.settings = G_reader_settings:readSetting("readest_sync", self.default_settings)
 
+    -- Ensure sync_queue is always initialized (for existing users)
+    if self.settings.sync_queue == nil then
+        self.settings.sync_queue = {}
+    end
+    -- Ensure storage_usage and storage_quota are initialized
+    if self.settings.storage_usage == nil then
+        self.settings.storage_usage = nil
+    end
+    if self.settings.storage_quota == nil then
+        self.settings.storage_quota = nil
+    end
+
     self.ui.menu:registerToMainMenu(self)
 end
 
