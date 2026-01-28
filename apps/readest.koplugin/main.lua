@@ -117,6 +117,12 @@ function ReadestSync:addToMainMenu(menu_items)
                 callback = function() self:syncAllBooks(true) end,
                 separator = true,
             },
+            {
+                text = _("Upload books to storage"),
+                enabled_func = function() return self.settings.access_token ~= nil end,
+                callback = function() self:showUploadBookList() end,
+                separator = true,
+            },
         }
     }
 end
@@ -420,6 +426,160 @@ function ReadestSync:syncAllBooks(interactive)
             end
         end
     end)
+end
+
+function ReadestSync:showUploadBookList()
+    if not self.settings.access_token then
+        UIManager:show(InfoMessage:new{ text = _("Please login first"), timeout = 2 })
+        return
+    end
+
+    if NetworkMgr:willRerunWhenOnline(function() self:showUploadBookList() end) then
+        return
+    end
+
+    local ReadHistory = require("readhistory")
+    local DocSettings = require("docsettings")
+    local Menu = require("ui/widget/menu")
+
+    -- Build book list
+    local book_table = {}
+    for _, v in ipairs(ReadHistory.hist) do
+        if v.dim then goto continue end
+
+        local ok, doc_settings = pcall(function() return DocSettings:open(v.file) end)
+        if not ok or not doc_settings then goto continue end
+
+        local doc_props = doc_settings:readSetting("doc_props")
+        if not doc_props then goto continue end
+
+        local title = doc_props.title or v.file
+        local authors = doc_props.authors or _("Unknown")
+        local book_hash = doc_settings:readSetting("partial_md5_checksum")
+
+        table.insert(book_table, {
+            text = title .. " - " .. authors,
+            filepath = v.file,
+            book_hash = book_hash,
+            doc_settings = doc_settings,
+            doc_props = doc_props,
+        })
+
+        ::continue::
+    end
+
+    if #book_table == 0 then
+        UIManager:show(InfoMessage:new{ text = _("No books found in library"), timeout = 2 })
+        return
+    end
+
+    -- Show menu
+    local menu = Menu:new{
+        title = _("Select books to upload"),
+        item_table = book_table,
+        is_borderless = true,
+        is_popout = false,
+        select_mode = "multi",
+        callback = function()
+            local selected = menu:getMultiSelection()
+            if #selected > 0 then
+                UIManager:close(menu)
+                self:uploadSelectedBooks(selected)
+            end
+        end,
+        close_callback = function()
+            UIManager:close(menu)
+        end
+    }
+    UIManager:show(menu)
+end
+
+function ReadestSync:uploadSelectedBooks(selections)
+    UIManager:show(InfoMessage:new{
+        text = T(_("Preparing to upload %1 books..."), #selections),
+        timeout = 1,
+    })
+
+    local client = self:getReadestStorageClient()
+    if not client then
+        UIManager:show(InfoMessage:new{ text = _("Failed to get storage client"), timeout = 2 })
+        return
+    end
+
+    self:tryRefreshToken()
+
+    -- Upload books sequentially
+    local index = 0
+    local success_count = 0
+    local fail_count = 0
+
+    local function uploadNext()
+        index = index + 1
+        if index > #selections then
+            UIManager:show(InfoMessage:new{
+                text = T(_("Upload complete: %1 succeeded, %2 failed"), success_count, fail_count),
+                timeout = 3,
+            })
+            return
+        end
+
+        local selection = selections[index]
+        local doc_settings = selection.doc_settings
+        local book_hash = doc_settings:readSetting("partial_md5_checksum")
+
+        if not book_hash then
+            logger.warn("ReadestSync: Book has no hash, skipping:", selection.filepath)
+            fail_count = fail_count + 1
+            UIManager:scheduleIn(0.1, uploadNext)
+            return
+        end
+
+        UIManager:show(InfoMessage:new{
+            text = T(_("Uploading %1 of %2..."), index, #selections),
+            timeout = 1,
+        })
+
+        -- Get file info
+        local file = io.open(selection.filepath, "rb")
+        if not file then
+            logger.warn("ReadestSync: Failed to open file:", selection.filepath)
+            fail_count = fail_count + 1
+            UIManager:scheduleIn(0.1, uploadNext)
+            return
+        end
+
+        local file_size = file:seek("end")
+        file:close()
+
+        local _, filename = util.splitFilePathName(selection.filepath)
+
+        -- Request upload URL
+        client:requestUpload({
+            fileName = filename,
+            fileSize = file_size,
+            bookHash = book_hash,
+        }, function(success, response)
+            if success and response.uploadUrl then
+                -- Upload file directly to storage
+                client:uploadFileToUrl(response.uploadUrl, selection.filepath, function(upload_ok, upload_res)
+                    if upload_ok then
+                        success_count = success_count + 1
+                        logger.dbg("ReadestSync: Uploaded:", selection.filepath)
+                    else
+                        fail_count = fail_count + 1
+                        logger.err("ReadestSync: Upload failed:", selection.filepath, upload_res)
+                    end
+                    UIManager:scheduleIn(0.1, uploadNext)
+                end)
+            else
+                fail_count = fail_count + 1
+                logger.err("ReadestSync: Failed to get upload URL:", response)
+                UIManager:scheduleIn(0.1, uploadNext)
+            end
+        end)
+    end
+
+    uploadNext()
 end
 
 function ReadestSync:login(menu)
