@@ -327,21 +327,21 @@ function ReadestSync:getBookMetadataFromFile(file_path, doc_settings)
     else status = "reading" end
 
     return {
-        user_id = self.settings.user_id,
-        book_hash = book_hash,
-        meta_hash = meta_hash,
+        userId = self.settings.user_id,
+        bookHash = book_hash,
+        metaHash = meta_hash,
         format = doc_props.document_format or "unknown",
         title = doc_props.title or "",
         author = author_list[1] or "",
-        group_id = nil,
-        group_name = nil,
+        groupId = nil,
+        groupName = nil,
         tags = {},
         progress = nil,
-        reading_status = status,
+        readingStatus = status,
         metadata = nil,
-        created_at = nil,
-        updated_at = os.time() * 1000,
-        deleted_at = nil
+        createdAt = nil,
+        updatedAt = os.time() * 1000,
+        deletedAt = nil
     }
 end
 
@@ -397,9 +397,9 @@ function ReadestSync:getAnnotationsFromDocSettings(doc_settings, book_hash, meta
             end
 
             table.insert(notes, {
-                user_id = self.settings.user_id,
-                book_hash = book_hash,
-                meta_hash = meta_hash,
+                userId = self.settings.user_id,
+                bookHash = book_hash,
+                metaHash = meta_hash,
                 id = self:generateNoteId(annotation),
                 type = note_type,
                 cfi = annotation.page,
@@ -407,8 +407,8 @@ function ReadestSync:getAnnotationsFromDocSettings(doc_settings, book_hash, meta
                 style = annotation.drawer or "highlight",
                 color = color or "#FFFF00",
                 note = annotation.note or "",
-                updated_at = updated_at,
-                deleted_at = nil
+                updatedAt = updated_at,
+                deletedAt = nil
             })
         end
     end
@@ -1579,9 +1579,9 @@ function ReadestSync:getCurrentBookNotes()
         end
 
         table.insert(notes, {
-            user_id = self.settings.user_id,
-            book_hash = book_hash,
-            meta_hash = meta_hash,
+            userId = self.settings.user_id,
+            bookHash = book_hash,
+            metaHash = meta_hash,
             id = self:generateNoteId(annotation),
             type = note_type,
             cfi = annotation.page,
@@ -1589,8 +1589,8 @@ function ReadestSync:getCurrentBookNotes()
             style = annotation.drawer or "highlight",
             color = color or "#FFFF00",
             note = annotation.note or "",
-            updated_at = updated_at,
-            deleted_at = nil
+            updatedAt = updated_at,
+            deletedAt = nil
         })
         ::continue::
     end
@@ -1617,7 +1617,7 @@ function ReadestSync:applyNotesToBook(notes)
             end
         end
 
-        if not exists and remote_note.deleted_at == nil then
+        if not exists and remote_note.deletedAt == nil then
             -- Parse color back to KOReader format
             local color = remote_note.color
             if color:match("#%x%x%x%x%x%x") then
@@ -1628,7 +1628,7 @@ function ReadestSync:applyNotesToBook(notes)
             end
 
             table.insert(notes_to_add, {
-                datetime = remote_note.updated_at / 1000,
+                datetime = remote_note.updatedAt / 1000,
                 datetime_updated = nil,
                 drawer = remote_note.style,
                 color = color,
