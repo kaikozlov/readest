@@ -411,6 +411,120 @@ function ReadestSync:applyBookConfig(config)
     end
 end
 
+function ReadestSync:generateNoteId(annotation)
+    local pos0_str = annotation.pos0 and string.format("%.0f_%.0f", annotation.pos0.x or 0, annotation.pos0.y or 0) or ""
+    local pos1_str = annotation.pos1 and string.format("%.0f_%.0f", annotation.pos1.x or 0, annotation.pos1.y or 0) or ""
+    local data = annotation.page .. "|" .. pos0_str .. "|" .. pos1_str .. "|" .. annotation.datetime
+    return sha2.md5(data)
+end
+
+function ReadestSync:getCurrentBookNotes()
+    if not self.ui.annotation or #self.ui.annotation.annotations == 0 then
+        return {}
+    end
+
+    local book_hash = self:getDocumentIdentifier()
+    local meta_hash = self:getMetaHash()
+    local notes = {}
+
+    for _, annotation in ipairs(self.ui.annotation.annotations) do
+        -- Skip bookmarks (no drawer = not a highlight)
+        if not annotation.drawer then
+            goto continue
+        end
+
+        local note_type = annotation.note and "annotation" or "highlight"
+        local color = annotation.color
+
+        -- Convert KOReader color to Readest format
+        if type(color) == "number" then
+            color = string.format("#%06x", color * 0xFFFFFF)
+        elseif type(color) == "table" then
+            color = string.format("#%02x%02x%02x",
+                math.floor((color[1] or 0) * 255),
+                math.floor((color[2] or 0) * 255),
+                math.floor((color[3] or 0) * 255))
+        end
+
+        local updated_at = annotation.datetime_updated or annotation.datetime
+        if type(updated_at) == "number" then
+            updated_at = updated_at * 1000
+        end
+
+        table.insert(notes, {
+            user_id = self.settings.user_id,
+            book_hash = book_hash,
+            meta_hash = meta_hash,
+            id = self:generateNoteId(annotation),
+            type = note_type,
+            cfi = annotation.page,
+            text = annotation.text or "",
+            style = annotation.drawer or "highlight",
+            color = color or "#FFFF00",
+            note = annotation.note or "",
+            updated_at = updated_at,
+            deleted_at = nil
+        })
+        ::continue::
+    end
+
+    return notes
+end
+
+function ReadestSync:applyNotesToBook(notes)
+    if not notes or #notes == 0 then
+        return
+    end
+
+    local current_annotations = self.ui.annotation.annotations
+    local notes_to_add = {}
+
+    for _, remote_note in ipairs(notes) do
+        -- Check if note already exists
+        local exists = false
+        for _, local_ann in ipairs(current_annotations) do
+            local local_id = self:generateNoteId(local_ann)
+            if local_id == remote_note.id then
+                exists = true
+                break
+            end
+        end
+
+        if not exists and remote_note.deleted_at == nil then
+            -- Parse color back to KOReader format
+            local color = remote_note.color
+            if color:match("#%x%x%x%x%x%x") then
+                local r = tonumber(color:sub(2, 3), 16) / 255
+                local g = tonumber(color:sub(4, 5), 16) / 255
+                local b = tonumber(color:sub(6, 7), 16) / 255
+                color = { r, g, b }
+            end
+
+            table.insert(notes_to_add, {
+                datetime = remote_note.updated_at / 1000,
+                datetime_updated = nil,
+                drawer = remote_note.style,
+                color = color,
+                text = remote_note.text,
+                note = remote_note.note,
+                page = remote_note.cfi,
+            })
+        end
+    end
+
+    for _, annotation in ipairs(notes_to_add) do
+        self.ui.annotation:addItem(annotation)
+    end
+
+    if #notes_to_add > 0 then
+        self.ui.doc_settings:saveSetting("annotations", self.ui.annotation.annotations)
+        UIManager:show(InfoMessage:new{
+            text = T(N_("Imported 1 note", "Imported %1 notes", #notes_to_add), #notes_to_add),
+            timeout = 2,
+        })
+    end
+end
+
 function ReadestSync:getCurrentBookConfig()
     local book_hash = self:getDocumentIdentifier()
     local meta_hash = self:getMetaHash()
@@ -485,9 +599,10 @@ function ReadestSync:pushBookConfig(interactive)
         })
     end
 
+    local notes = self:getCurrentBookNotes()
     local payload = {
       books = {},
-      notes = {},
+      notes = notes,
       configs = { config }
     }
 
@@ -530,7 +645,14 @@ function ReadestSync:pullBookConfig(interactive)
     local meta_hash = self:getMetaHash()
     if not book_hash or not meta_hash then return end
 
-    if NetworkMgr:willRerunWhenOnline(function() self:pullBookConfig(interactive) end) then
+    -- Only prompt for WiFi if user explicitly requested sync
+    -- For auto-sync (non-interactive), silently skip if offline
+    if interactive then
+        if NetworkMgr:willRerunWhenOnline(function() self:pullBookConfig(interactive) end) then
+            return
+        end
+    elseif not NetworkMgr:isConnected() then
+        logger.dbg("ReadestSync: Offline, skipping auto pull")
         return
     end
 
@@ -587,16 +709,25 @@ function ReadestSync:pullBookConfig(interactive)
                 local config = data[1]
                 if config then
                     self:applyBookConfig(config)
-                    if interactive then
-                        UIManager:show(InfoMessage:new{
-                            text = _("Book config synchronized"),
-                            timeout = 2,
-                        })
-                    end
-                    return
                 end
             end
-            
+
+            -- Check for notes and apply them
+            local notes = response.notes
+            if notes and #notes > 0 then
+                self:applyNotesToBook(notes)
+            end
+
+            if data and #data > 0 then
+                if interactive then
+                    UIManager:show(InfoMessage:new{
+                        text = _("Book config synchronized"),
+                        timeout = 2,
+                    })
+                end
+                return
+            end
+
             if interactive then
                 UIManager:show(InfoMessage:new{
                     text = _("No saved config found for this book"),
@@ -628,9 +759,12 @@ end
 
 function ReadestSync:onCloseDocument()
     if self.settings.auto_sync and self.settings.access_token then
-        NetworkMgr:goOnlineToRun(function()
+        -- Only sync if already online, don't prompt for WiFi on document close
+        if NetworkMgr:isConnected() then
             self:pushBookConfig(false)
-        end)
+        else
+            logger.dbg("ReadestSync: Offline, skipping auto push on close")
+        end
     end
 end
 
