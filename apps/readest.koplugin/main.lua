@@ -169,6 +169,18 @@ function ReadestSync:getReadestSyncClient()
     }
 end
 
+function ReadestSync:getReadestStorageClient()
+    if not self.settings.access_token or not self.settings.expires_at or self.settings.expires_at < os.time() then
+        return nil
+    end
+
+    local ReadestStorageClient = require("readeststorage")
+    return ReadestStorageClient:new{
+        service_spec = self.path .. "/readest-storage-api.json",
+        access_token = self.settings.access_token,
+    }
+end
+
 function ReadestSync:getBookMetadataFromFile(file_path, doc_settings)
     local doc_props = doc_settings:readSetting("doc_props")
     if not doc_props then return nil end

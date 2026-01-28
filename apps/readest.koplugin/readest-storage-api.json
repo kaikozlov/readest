@@ -1,0 +1,41 @@
+{
+  "base_url": "https://readest.app/api/storage",
+  "name": "readest-storage-api",
+  "methods": {
+    "upload": {
+      "path": "/upload",
+      "method": "POST",
+      "required_params": [],
+      "optional_params": ["fileName", "fileSize", "bookHash", "temp"],
+      "expected_status": [200, 201, 400, 401, 403]
+    },
+    "download": {
+      "path": "/download",
+      "method": "GET",
+      "required_params": ["fileKey"],
+      "optional_params": [],
+      "expected_status": [200, 400, 401, 403, 404]
+    },
+    "list": {
+      "path": "/list",
+      "method": "GET",
+      "required_params": [],
+      "optional_params": ["page", "limit", "orderBy", "order"],
+      "expected_status": [200, 400, 401, 403]
+    },
+    "delete": {
+      "path": "/delete",
+      "method": "DELETE",
+      "required_params": ["fileKey"],
+      "optional_params": [],
+      "expected_status": [200, 400, 401, 403, 404]
+    },
+    "stats": {
+      "path": "/stats",
+      "method": "GET",
+      "required_params": [],
+      "optional_params": [],
+      "expected_status": [200, 400, 401, 403]
+    }
+  }
+}
