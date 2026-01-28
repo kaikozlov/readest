@@ -111,6 +111,12 @@ function ReadestSync:addToMainMenu(menu_items)
                     self:pullBookConfig(true)
                 end,
             },
+            {
+                text = _("Sync all books in library"),
+                enabled_func = function() return self.settings.access_token ~= nil end,
+                callback = function() self:syncAllBooks(true) end,
+                separator = true,
+            },
         }
     }
 end
@@ -161,6 +167,247 @@ function ReadestSync:getReadestSyncClient()
         service_spec = self.path .. "/readest-sync-api.json",
         access_token = self.settings.access_token,
     }
+end
+
+function ReadestSync:getBookMetadataFromFile(file_path, doc_settings)
+    local doc_props = doc_settings:readSetting("doc_props")
+    if not doc_props then return nil end
+
+    local book_hash = doc_settings:readSetting("partial_md5_checksum")
+    if not book_hash then return nil end
+
+    -- Get or generate metadata hash
+    local doc_readest_sync = doc_settings:readSetting("readest_sync") or {}
+    local meta_hash = doc_readest_sync.meta_hash_v1
+    if not meta_hash then
+        local title = doc_props.title or ""
+        if title == "" then
+            local _, filename = util.splitFilePathName(file_path)
+            local basename, _ = util.splitFileNameSuffix(filename)
+            title = basename or ""
+        end
+
+        local authors = doc_props.authors or ""
+        if authors:find("\n") then
+            authors = util.splitToArray(authors, "\n")
+            for i, author in ipairs(authors) do
+                authors[i] = normalizeAuthor(author)
+            end
+            authors = table.concat(authors, ",")
+        else
+            authors = normalizeAuthor(authors)
+        end
+
+        local identifiers = doc_props.identifiers or ""
+        if identifiers:find("\n") then
+            local list = util.splitToArray(identifiers, "\n")
+            local normalized = {}
+            local priorities = { "uuid", "calibre", "isbn" }
+            local preferred = nil
+            for _, id in ipairs(list) do
+                table.insert(normalized, normalizeIdentifier(id))
+                local candidate = id:lower()
+                for _, p in ipairs(priorities) do
+                    if candidate:find(p, 1, true) then
+                        preferred = normalizeIdentifier(id)
+                        break
+                    end
+                end
+            end
+            identifiers = preferred or table.concat(normalized, ",")
+        else
+            identifiers = normalizeIdentifier(identifiers)
+        end
+
+        local doc_meta = title .. "|" .. authors .. "|" .. identifiers
+        meta_hash = sha2.md5(doc_meta)
+    end
+
+    local author_str = doc_props.authors or ""
+    local author_list = {}
+    if author_str:find("\n") then
+        author_list = util.splitToArray(author_str, "\n")
+    else
+        table.insert(author_list, author_str)
+    end
+
+    local summary = doc_settings:readSetting("summary") or {}
+    local status = summary.status or "reading"
+    if status == "complete" then status = "finished"
+    elseif status == "abandoned" then status = "abandoned"
+    else status = "reading" end
+
+    return {
+        user_id = self.settings.user_id,
+        book_hash = book_hash,
+        meta_hash = meta_hash,
+        format = doc_props.document_format or "unknown",
+        title = doc_props.title or "",
+        author = author_list[1] or "",
+        group_id = nil,
+        group_name = nil,
+        tags = {},
+        progress = nil,
+        reading_status = status,
+        metadata = nil,
+        created_at = nil,
+        updated_at = os.time() * 1000,
+        deleted_at = nil
+    }
+end
+
+function ReadestSync:getConfigFromDocSettings(doc_settings)
+    local book_hash = doc_settings:readSetting("partial_md5_checksum")
+    if not book_hash then return nil end
+
+    local doc_readest_sync = doc_settings:readSetting("readest_sync") or {}
+    local meta_hash = doc_readest_sync.meta_hash_v1
+    if not meta_hash then return nil end
+
+    local summary = doc_settings:readSetting("summary") or {}
+    local config = {
+        bookHash = book_hash,
+        metaHash = meta_hash,
+        progress = "",
+        xpointer = "",
+        updatedAt = os.time() * 1000,
+    }
+
+    if summary.last_page then
+        local total_pages = summary.total_pages or 0
+        config.progress = string.format("[%d,%d]", summary.last_page, total_pages)
+    end
+
+    local xpointer = doc_settings:readSetting("last_xpointer")
+    if xpointer then config.xpointer = xpointer end
+
+    return config
+end
+
+function ReadestSync:getAnnotationsFromDocSettings(doc_settings, book_hash, meta_hash)
+    local annotations = doc_settings:readSetting("annotations") or {}
+    local notes = {}
+
+    for _, annotation in ipairs(annotations) do
+        if annotation.drawer then
+            local note_type = annotation.note and "annotation" or "highlight"
+            local color = annotation.color
+
+            if type(color) == "number" then
+                color = string.format("#%06x", color * 0xFFFFFF)
+            elseif type(color) == "table" then
+                color = string.format("#%02x%02x%02x",
+                    math.floor((color[1] or 0) * 255),
+                    math.floor((color[2] or 0) * 255),
+                    math.floor((color[3] or 0) * 255))
+            end
+
+            local updated_at = annotation.datetime_updated or annotation.datetime
+            if type(updated_at) == "number" then
+                updated_at = updated_at * 1000
+            end
+
+            table.insert(notes, {
+                user_id = self.settings.user_id,
+                book_hash = book_hash,
+                meta_hash = meta_hash,
+                id = self:generateNoteId(annotation),
+                type = note_type,
+                cfi = annotation.page,
+                text = annotation.text or "",
+                style = annotation.drawer or "highlight",
+                color = color or "#FFFF00",
+                note = annotation.note or "",
+                updated_at = updated_at,
+                deleted_at = nil
+            })
+        end
+    end
+
+    return notes
+end
+
+function ReadestSync:syncAllBooks(interactive)
+    if not self.settings.access_token then
+        if interactive then
+            UIManager:show(InfoMessage:new{ text = _("Please login first"), timeout = 2 })
+        end
+        return
+    end
+
+    if interactive and NetworkMgr:willRerunWhenOnline(function() self:syncAllBooks(interactive) end) then
+        return
+    end
+
+    local ReadHistory = require("readhistory")
+    local DocSettings = require("docsettings")
+
+    if interactive then
+        UIManager:show(InfoMessage:new{ text = _("Scanning library..."), timeout = 1 })
+    end
+
+    local books = {}
+    local all_notes = {}
+    local all_configs = {}
+    local processed = 0
+
+    for _, v in ipairs(ReadHistory.hist) do
+        if v.dim then goto continue end
+
+        local ok, doc_settings = pcall(function() return DocSettings:open(v.file) end)
+        if not ok or not doc_settings then goto continue end
+
+        local metadata = self:getBookMetadataFromFile(v.file, doc_settings)
+        if metadata then table.insert(books, metadata) end
+
+        local book_hash = doc_settings:readSetting("partial_md5_checksum")
+        local doc_readest_sync = doc_settings:readSetting("readest_sync") or {}
+        local meta_hash = doc_readest_sync.meta_hash_v1
+
+        if book_hash and meta_hash then
+            local annotations = self:getAnnotationsFromDocSettings(doc_settings, book_hash, meta_hash)
+            for _, note in ipairs(annotations) do
+                table.insert(all_notes, note)
+            end
+
+            local config = self:getConfigFromDocSettings(doc_settings)
+            if config then table.insert(all_configs, config) end
+        end
+
+        processed = processed + 1
+        ::continue::
+    end
+
+    if interactive then
+        UIManager:show(InfoMessage:new{ text = T(_("Syncing %1 books..."), processed), timeout = 1 })
+    end
+
+    local client = self:getReadestSyncClient()
+    if not client then
+        if interactive then
+            UIManager:show(InfoMessage:new{ text = _("Failed to get sync client"), timeout = 2 })
+        end
+        return
+    end
+
+    self:tryRefreshToken()
+
+    local payload = { books = books, notes = all_notes, configs = all_configs }
+
+    client:pushChanges(payload, function(success, response)
+        if interactive then
+            if success then
+                UIManager:show(InfoMessage:new{
+                    text = T(_("Synced %1 books"), processed),
+                    timeout = 3,
+                })
+                self.settings.last_sync_at = os.time()
+                G_reader_settings:saveSetting("readest_sync", self.settings)
+            else
+                UIManager:show(InfoMessage:new{ text = _("Sync failed"), timeout = 2 })
+            end
+        end
+    end)
 end
 
 function ReadestSync:login(menu)
