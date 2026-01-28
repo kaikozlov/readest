@@ -86,7 +86,12 @@ function ReadestStorageClient:requestUpload(params, callback)
             callback(res.status == 200, res.body)
         else
             logger.dbg("ReadestStorageClient:requestUpload failure:", res)
-            callback(false, res)
+            -- Pass the error as a table with error field
+            if type(res) == "table" then
+                callback(false, res)
+            else
+                callback(false, {error = tostring(res)})
+            end
         end
     end)
     self.client:enable("AsyncHTTP", {thread = co})
@@ -110,7 +115,12 @@ function ReadestStorageClient:requestDownload(fileKey, callback)
             callback(res.status == 200, res.body)
         else
             logger.dbg("ReadestStorageClient:requestDownload failure:", res)
-            callback(false, res)
+            -- Pass the error as a table with error field
+            if type(res) == "table" then
+                callback(false, res)
+            else
+                callback(false, {error = tostring(res)})
+            end
         end
     end)
     self.client:enable("AsyncHTTP", {thread = co})
@@ -139,7 +149,12 @@ function ReadestStorageClient:listFiles(params, callback)
             callback(res.status == 200, res.body)
         else
             logger.dbg("ReadestStorageClient:listFiles failure:", res)
-            callback(false, res)
+            -- Pass the error as a table with error field
+            if type(res) == "table" then
+                callback(false, res)
+            else
+                callback(false, {error = tostring(res)})
+            end
         end
     end)
     self.client:enable("AsyncHTTP", {thread = co})
@@ -163,7 +178,12 @@ function ReadestStorageClient:deleteFile(fileKey, callback)
             callback(res.status == 200, res.body)
         else
             logger.dbg("ReadestStorageClient:deleteFile failure:", res)
-            callback(false, res)
+            -- Pass the error as a table with error field
+            if type(res) == "table" then
+                callback(false, res)
+            else
+                callback(false, {error = tostring(res)})
+            end
         end
     end)
     self.client:enable("AsyncHTTP", {thread = co})
@@ -187,7 +207,12 @@ function ReadestStorageClient:getStats(callback)
             callback(res.status == 200, res.body)
         else
             logger.dbg("ReadestStorageClient:getStats failure:", res)
-            callback(false, res)
+            -- Pass the error as a table with error field
+            if type(res) == "table" then
+                callback(false, res)
+            else
+                callback(false, {error = tostring(res)})
+            end
         end
     end)
     self.client:enable("AsyncHTTP", {thread = co})

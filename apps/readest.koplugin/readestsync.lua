@@ -73,7 +73,7 @@ function ReadestSyncClient:pullChanges(params, callback)
     self.client:enable("Format.JSON")
     self.client:enable("ReadestHeaders", {})
     self.client:enable("ReadestAuth", {})
-    
+
     socketutil:set_timeout(SYNC_TIMEOUTS[1], SYNC_TIMEOUTS[2])
     local co = coroutine.create(function()
         local ok, res = pcall(function()
@@ -88,7 +88,12 @@ function ReadestSyncClient:pullChanges(params, callback)
             callback(res.status == 200, res.body)
         else
             logger.dbg("ReadestSyncClient:pullChanges failure:", res)
-            callback(false, res.body)
+            -- Pass the error as a table with error field
+            if type(res) == "table" then
+                callback(false, res)
+            else
+                callback(false, {error = tostring(res)})
+            end
         end
     end)
     self.client:enable("AsyncHTTP", {thread = co})
@@ -112,7 +117,12 @@ function ReadestSyncClient:pushChanges(changes, callback)
             callback(res.status == 200, res.body)
         else
             logger.dbg("ReadestSyncClient:pushChanges failure:", res)
-            callback(false, res.body)
+            -- Pass the error as a table with error field
+            if type(res) == "table" then
+                callback(false, res)
+            else
+                callback(false, {error = tostring(res)})
+            end
         end
     end)
     self.client:enable("AsyncHTTP", {thread = co})
