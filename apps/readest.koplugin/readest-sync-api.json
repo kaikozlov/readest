@@ -6,14 +6,14 @@
       "path": "/sync",
       "method": "GET",
       "required_params": ["since", "type", "book", "meta_hash"],
-      "expected_status": [200, 400, 301, 401, 403]
+      "expected_status": [200, 400, 301, 401, 403, 404, 500, 502, 503]
     },
     "pushChanges": {
       "path": "/sync",
       "method": "POST",
       "required_params": ["books", "notes", "configs"],
       "payload": ["books", "notes", "configs"],
-      "expected_status": [200, 201, 301, 400, 401, 403]
+      "expected_status": [200, 201, 301, 400, 401, 403, 404, 500, 502, 503]
     }
   }
 }

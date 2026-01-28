@@ -7,35 +7,35 @@
       "method": "POST",
       "required_params": [],
       "optional_params": ["fileName", "fileSize", "bookHash", "temp"],
-      "expected_status": [200, 201, 400, 401, 403]
+      "expected_status": [200, 201, 400, 401, 403, 404, 500, 502, 503]
     },
     "download": {
       "path": "/download",
       "method": "GET",
       "required_params": ["fileKey"],
       "optional_params": [],
-      "expected_status": [200, 400, 401, 403, 404]
+      "expected_status": [200, 400, 401, 403, 404, 500, 502, 503]
     },
     "list": {
       "path": "/list",
       "method": "GET",
       "required_params": [],
       "optional_params": ["page", "limit", "orderBy", "order"],
-      "expected_status": [200, 400, 401, 403]
+      "expected_status": [200, 400, 401, 403, 500, 502, 503]
     },
     "delete": {
       "path": "/delete",
       "method": "DELETE",
       "required_params": ["fileKey"],
       "optional_params": [],
-      "expected_status": [200, 400, 401, 403, 404]
+      "expected_status": [200, 400, 401, 403, 404, 500, 502, 503]
     },
     "stats": {
       "path": "/stats",
       "method": "GET",
       "required_params": [],
       "optional_params": [],
-      "expected_status": [200, 400, 401, 403]
+      "expected_status": [200, 400, 401, 403, 500, 502, 503]
     }
   }
 }
