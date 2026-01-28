@@ -123,6 +123,11 @@ function ReadestSync:addToMainMenu(menu_items)
                 callback = function() self:showUploadBookList() end,
                 separator = true,
             },
+            {
+                text = _("Download books from storage"),
+                enabled_func = function() return self.settings.access_token ~= nil end,
+                callback = function() self:showDownloadBookList() end,
+            },
         }
     }
 end
@@ -580,6 +585,258 @@ function ReadestSync:uploadSelectedBooks(selections)
     end
 
     uploadNext()
+end
+
+function ReadestSync:showDownloadBookList()
+    if not self.settings.access_token then
+        UIManager:show(InfoMessage:new{ text = _("Please login first"), timeout = 2 })
+        return
+    end
+
+    if NetworkMgr:willRerunWhenOnline(function() self:showDownloadBookList() end) then
+        return
+    end
+
+    UIManager:show(InfoMessage:new{ text = _("Fetching book list..."), timeout = 1 })
+
+    local client = self:getReadestStorageClient()
+    if not client then
+        UIManager:show(InfoMessage:new{ text = _("Failed to get storage client"), timeout = 2 })
+        return
+    end
+
+    self:tryRefreshToken()
+
+    client:listFiles({ limit = 100 }, function(success, response)
+        if not success then
+            UIManager:show(InfoMessage:new{ text = _("Failed to fetch book list"), timeout = 2 })
+            return
+        end
+
+        local files = response.files or response.data or {}
+        if #files == 0 then
+            UIManager:show(InfoMessage:new{ text = _("No books found in storage"), timeout = 2 })
+            return
+        end
+
+        self:showDownloadSelection(files)
+    end)
+end
+
+function ReadestSync:showDownloadSelection(files)
+    local Menu = require("ui/widget/menu")
+    local local_dir = self:getDownloadDirectory()
+
+    -- Build file list
+    local file_table = {}
+    for _, file in ipairs(files) do
+        local fileKey = file.file_key or file.fileKey
+        local fileName = file.file_name or file.fileName or fileKey:match("/([^/]+)$")
+        local fileSize = file.file_size or file.fileSize or 0
+        local bookHash = file.book_hash or file.bookHash
+
+        -- Check if file exists locally
+        local local_path = local_dir .. "/" .. fileName
+        local exists = util.pathExists(local_path)
+        local local_hash = nil
+
+        if exists then
+            -- Get local hash
+            local DocSettings = require("docsettings")
+            local ok, doc_settings = pcall(function() return DocSettings:open(local_path) end)
+            if ok and doc_settings then
+                local_hash = doc_settings:readSetting("partial_md5_checksum")
+            end
+        end
+
+        local status_text = ""
+        if exists then
+            if local_hash == bookHash then
+                status_text = " (✓ up to date)"
+            else
+                status_text = " (⚠ different version)"
+            end
+        else
+            status_text = " (new)"
+        end
+
+        table.insert(file_table, {
+            text = fileName .. status_text,
+            file_key = fileKey,
+            file_name = fileName,
+            book_hash = bookHash,
+            file_size = fileSize,
+            local_exists = exists,
+            local_hash = local_hash,
+            local_path = local_path,
+        })
+    end
+
+    local menu = Menu:new{
+        title = _("Select books to download"),
+        item_table = file_table,
+        is_borderless = true,
+        is_popout = false,
+        select_mode = "multi",
+        callback = function()
+            local selected = menu:getMultiSelection()
+            if #selected > 0 then
+                UIManager:close(menu)
+                self:downloadSelectedBooks(selected, local_dir)
+            end
+        end,
+        close_callback = function()
+            UIManager:close(menu)
+        end
+    }
+    UIManager:show(menu)
+end
+
+function ReadestSync:getDownloadDirectory()
+    -- Use KOReader's download directory or default to home
+    local download_dir = G_reader_settings:readSetting("download_dir") or
+                         os.getenv("HOME") .. "/Downloads"
+
+    -- Ensure directory exists
+    if not util.pathExists(download_dir) then
+        util.makePath(download_dir)
+    end
+
+    return download_dir
+end
+
+function ReadestSync:downloadSelectedBooks(selections, download_dir)
+    local client = self:getReadestStorageClient()
+    if not client then
+        UIManager:show(InfoMessage:new{ text = _("Failed to get storage client"), timeout = 2 })
+        return
+    end
+
+    -- Check for conflicts
+    local conflicts = {}
+    local no_conflicts = {}
+
+    for _, selection in ipairs(selections) do
+        if selection.local_exists and selection.local_hash ~= selection.book_hash then
+            table.insert(conflicts, selection)
+        else
+            table.insert(no_conflicts, selection)
+        end
+    end
+
+    -- Handle conflicts
+    if #conflicts > 0 then
+        self:handleConflicts(conflicts, no_conflicts, download_dir, client)
+    else
+        self:downloadBooks(no_conflicts, download_dir, client)
+    end
+end
+
+function ReadestSync:handleConflicts(conflicts, no_conflicts, download_dir, client)
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local ConfirmWidget = require("ui/widget/confirmbox")
+
+    -- For each conflict, ask user what to do
+    local conflict_index = 0
+
+    local function handleNextConflict()
+        conflict_index = conflict_index + 1
+        if conflict_index > #conflicts then
+            -- All conflicts handled, proceed with downloads
+            self:downloadBooks(no_conflicts, download_dir, client)
+            return
+        end
+
+        local conflict = conflicts[conflict_index]
+        local size_mb = string.format("%.2f MB", conflict.file_size / (1024 * 1024))
+
+        UIManager:show(ConfirmWidget:new{
+            text = T(_("%1\nSize: %2\n\nA different version exists locally.\nLocal hash: %3\nRemote hash: %4\n\nOverwrite local file?"),
+                conflict.file_name, size_mb,
+                conflict.local_hash or "unknown",
+                conflict.book_hash or "unknown"),
+            ok_text = _("Overwrite"),
+            ok_callback = function()
+                table.insert(no_conflicts, conflict)
+                UIManager:scheduleIn(0.1, handleNextConflict)
+            end,
+            cancel_text = _("Skip"),
+            cancel_callback = function()
+                UIManager:scheduleIn(0.1, handleNextConflict)
+            end
+        })
+    end
+
+    handleNextConflict()
+end
+
+function ReadestSync:downloadBooks(selections, download_dir, client)
+    UIManager:show(InfoMessage:new{
+        text = T(_("Downloading %1 books..."), #selections),
+        timeout = 1,
+    })
+
+    local index = 0
+    local success_count = 0
+    local fail_count = 0
+    local skipped_count = 0
+
+    local function downloadNext()
+        index = index + 1
+        if index > #selections then
+            UIManager:show(InfoMessage:new{
+                text = T(_("Download complete: %1 succeeded, %2 failed, %3 skipped"),
+                    success_count, fail_count, skipped_count),
+                timeout = 3,
+            })
+            return
+        end
+
+        local selection = selections[index]
+
+        -- Skip if up to date
+        if selection.local_exists and selection.local_hash == selection.book_hash then
+            skipped_count = skipped_count + 1
+            UIManager:scheduleIn(0.1, downloadNext)
+            return
+        end
+
+        UIManager:show(InfoMessage:new{
+            text = T(_("Downloading %1 of %2..."), index, #selections),
+            timeout = 1,
+        })
+
+        -- Request download URL
+        client:requestDownload(selection.file_key, function(success, response)
+            if success and response.downloadUrl then
+                local dest_path = download_dir .. "/" .. selection.file_name
+
+                -- Download file
+                client:downloadFileFromUrl(response.downloadUrl, dest_path, function(download_ok, download_res)
+                    if download_ok then
+                        success_count = success_count + 1
+                        logger.dbg("ReadestSync: Downloaded:", selection.file_name)
+
+                        -- Add to KOReader library
+                        local FileManager = require("apps/filemanager/filemanager")
+                        if FileManager.instance then
+                            FileManager.instance:onRefresh()
+                        end
+                    else
+                        fail_count = fail_count + 1
+                        logger.err("ReadestSync: Download failed:", selection.file_name, download_res)
+                    end
+                    UIManager:scheduleIn(0.1, downloadNext)
+                end)
+            else
+                fail_count = fail_count + 1
+                logger.err("ReadestSync: Failed to get download URL:", response)
+                UIManager:scheduleIn(0.1, downloadNext)
+            end
+        end)
+    end
+
+    downloadNext()
 end
 
 function ReadestSync:login(menu)
