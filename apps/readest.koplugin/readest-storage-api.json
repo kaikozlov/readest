@@ -1,5 +1,5 @@
 {
-  "base_url": "https://readest.app/api/storage",
+  "base_url": "https://web.readest.com/api/storage",
   "name": "readest-storage-api",
   "methods": {
     "upload": {
@@ -7,6 +7,7 @@
       "method": "POST",
       "required_params": [],
       "optional_params": ["fileName", "fileSize", "bookHash", "temp"],
+      "payload": ["fileName", "fileSize", "bookHash", "temp"],
       "expected_status": [200, 201, 400, 401, 403, 404, 500, 502, 503]
     },
     "download": {

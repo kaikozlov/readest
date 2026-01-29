@@ -21,7 +21,35 @@ end
 
 function ReadestStorageClient:init()
     local Spore = require("Spore")
-    self.client = Spore.new_from_spec(self.service_spec)
+    local dkjson = require("dkjson")
+    logger.warn("ReadestStorageClient: Loading spec from:", self.service_spec)
+
+    -- Read the JSON file content
+    local file = io.open(self.service_spec, "r")
+    if not file then
+        logger.err("ReadestStorageClient: FAILED to open JSON file!")
+        return
+    end
+    local content = file:read("*all")
+    file:close()
+    logger.warn("ReadestStorageClient: JSON file content length:", #content)
+
+    -- Parse with dkjson to verify
+    local spec, pos, err = dkjson.decode(content)
+    if not spec then
+        logger.err("ReadestStorageClient: JSON parse error:", err)
+        return
+    end
+    logger.warn("ReadestStorageClient: spec.base_url from dkjson:", spec.base_url)
+    logger.warn("ReadestStorageClient: spec.methods:", spec.methods and "present" or "nil")
+
+    -- Use new_from_string
+    self.client = Spore.new_from_string(content)
+    logger.warn("ReadestStorageClient: Client created")
+
+    -- Check what the upload method's internal state looks like
+    -- The method is a function, but we can call it and check the error to trace the issue
+    -- Or we can intercept at the middleware level
 
     -- Headers middleware
     package.loaded["Spore.Middleware.StorageHeaders"] = {}
@@ -44,26 +72,63 @@ function ReadestStorageClient:init()
     -- Async HTTP
     package.loaded["Spore.Middleware.AsyncHTTP"] = {}
     require("Spore.Middleware.AsyncHTTP").call = function(args, req)
-        if not UIManager.looper then return end
         req:finalize()
+        logger.warn("ReadestStorageClient: AsyncHTTP req.url =", req.url)
+        logger.warn("ReadestStorageClient: AsyncHTTP req.method =", req.method)
+        logger.warn("ReadestStorageClient: UIManager.looper =", UIManager.looper and "exists" or "nil")
+
         local result
-        require("httpclient"):new():request({
-            url = req.url,
-            method = req.method,
-            body = req.env.spore.payload,
-            on_headers = function(headers)
-                for header, value in pairs(req.headers) do
-                    if type(header) == "string" then
-                        headers:add(header, value)
+        if UIManager.looper then
+            -- Async request using Turbo
+            require("httpclient"):new():request({
+                url = req.url,
+                method = req.method,
+                body = req.env.spore.payload,
+                on_headers = function(headers)
+                    for header, value in pairs(req.headers) do
+                        if type(header) == "string" then
+                            headers:add(header, value)
+                        end
                     end
                 end
+            }, function(res)
+                result = res
+                result.status = res.code
+                coroutine.resume(args.thread)
+            end)
+            return coroutine.create(function() coroutine.yield(result) end)
+        else
+            -- Sync request using ssl.https
+            local https = require("ssl.https")
+            local ltn12 = require("ltn12")
+            local response_body = {}
+
+            local request_body = req.env.spore.payload or ""
+            logger.warn("ReadestStorageClient: sync request_body =", request_body)
+            logger.warn("ReadestStorageClient: sync headers =", req.headers)
+
+            local ok, code, response_headers = https.request{
+                url = req.url,
+                method = req.method,
+                headers = req.headers,
+                source = ltn12.source.string(request_body),
+                sink = ltn12.sink.table(response_body),
+            }
+            local body_str = table.concat(response_body)
+            logger.warn("ReadestStorageClient: sync request result:", ok, code)
+            logger.warn("ReadestStorageClient: sync response body:", body_str:sub(1, 500))
+
+            if ok then
+                return {
+                    status = code,
+                    headers = response_headers,
+                    body = body_str,
+                }
+            else
+                logger.warn("ReadestStorageClient: sync request failed:", code)
+                return { status = 599, body = tostring(code) }
             end
-        }, function(res)
-            result = res
-            result.status = res.code
-            coroutine.resume(args.thread)
-        end)
-        return coroutine.create(function() coroutine.yield(result) end)
+        end
     end
 end
 
@@ -86,7 +151,7 @@ function ReadestStorageClient:requestUpload(params, callback)
         if ok then
             callback(res.status == 200, res.body)
         else
-            logger.dbg("ReadestStorageClient:requestUpload failure:", res)
+            logger.warn("ReadestStorageClient:requestUpload failure:", res)
             -- Pass the error as a table with error field
             if type(res) == "table" then
                 callback(false, res)
@@ -115,7 +180,7 @@ function ReadestStorageClient:requestDownload(fileKey, callback)
         if ok then
             callback(res.status == 200, res.body)
         else
-            logger.dbg("ReadestStorageClient:requestDownload failure:", res)
+            logger.warn("ReadestStorageClient:requestDownload failure:", res)
             -- Pass the error as a table with error field
             if type(res) == "table" then
                 callback(false, res)
@@ -149,7 +214,7 @@ function ReadestStorageClient:listFiles(params, callback)
         if ok then
             callback(res.status == 200, res.body)
         else
-            logger.dbg("ReadestStorageClient:listFiles failure:", res)
+            logger.warn("ReadestStorageClient:listFiles failure:", res)
             -- Pass the error as a table with error field
             if type(res) == "table" then
                 callback(false, res)
@@ -178,7 +243,7 @@ function ReadestStorageClient:deleteFile(fileKey, callback)
         if ok then
             callback(res.status == 200, res.body)
         else
-            logger.dbg("ReadestStorageClient:deleteFile failure:", res)
+            logger.warn("ReadestStorageClient:deleteFile failure:", res)
             -- Pass the error as a table with error field
             if type(res) == "table" then
                 callback(false, res)
@@ -207,7 +272,7 @@ function ReadestStorageClient:getStats(callback)
         if ok then
             callback(res.status == 200, res.body)
         else
-            logger.dbg("ReadestStorageClient:getStats failure:", res)
+            logger.warn("ReadestStorageClient:getStats failure:", res)
             -- Pass the error as a table with error field
             if type(res) == "table" then
                 callback(false, res)
@@ -223,8 +288,8 @@ function ReadestStorageClient:getStats(callback)
 end
 
 function ReadestStorageClient:uploadFileToUrl(uploadUrl, filePath, callback)
-    -- Use socket.http for direct upload to storage
-    local http = require("socket.http")
+    -- Use ssl.https for direct upload to storage (URLs are HTTPS)
+    local https = require("ssl.https")
     local ltn12 = require("ltn12")
 
     local file = io.open(filePath, "rb")
@@ -236,21 +301,25 @@ function ReadestStorageClient:uploadFileToUrl(uploadUrl, filePath, callback)
     local file_content = file:read("*all")
     file:close()
 
-    local ok, result, code = pcall(function()
-        return http.request{
-            url = uploadUrl,
-            method = "PUT",
-            headers = {
-                ["Content-Type"] = "application/octet-stream",
-                ["Content-Length"] = #file_content,
-            },
-            source = ltn12.source.string(file_content),
-            sink = ltn12.sink.table({})
-        }
-    end)
+    logger.warn("ReadestStorageClient:uploadFileToUrl url=", uploadUrl)
+    logger.warn("ReadestStorageClient:uploadFileToUrl size=", #file_content)
+
+    local response_body = {}
+    local ok, code, headers = https.request{
+        url = uploadUrl,
+        method = "PUT",
+        headers = {
+            ["Content-Type"] = "application/octet-stream",
+            ["Content-Length"] = tostring(#file_content),
+        },
+        source = ltn12.source.string(file_content),
+        sink = ltn12.sink.table(response_body),
+    }
+
+    logger.warn("ReadestStorageClient:uploadFileToUrl result:", ok, code)
 
     if not ok then
-        callback(false, {error = "HTTP request failed: " .. tostring(result)})
+        callback(false, {error = "HTTPS request failed: " .. tostring(code)})
         return
     end
 
@@ -258,7 +327,8 @@ function ReadestStorageClient:uploadFileToUrl(uploadUrl, filePath, callback)
 end
 
 function ReadestStorageClient:downloadFileFromUrl(downloadUrl, filePath, callback)
-    local http = require("socket.http")
+    -- Use ssl.https for downloads (URLs are HTTPS)
+    local https = require("ssl.https")
     local ltn12 = require("ltn12")
 
     local file = io.open(filePath, "wb")
@@ -267,19 +337,21 @@ function ReadestStorageClient:downloadFileFromUrl(downloadUrl, filePath, callbac
         return
     end
 
-    local ok, result, code = pcall(function()
-        return http.request{
-            url = downloadUrl,
-            method = "GET",
-            sink = ltn12.sink.file(file)
-        }
-    end)
+    logger.warn("ReadestStorageClient:downloadFileFromUrl url=", downloadUrl)
+
+    local ok, code, headers = https.request{
+        url = downloadUrl,
+        method = "GET",
+        sink = ltn12.sink.file(file)
+    }
 
     file:close()
 
+    logger.warn("ReadestStorageClient:downloadFileFromUrl result:", ok, code)
+
     if not ok then
         os.remove(filePath) -- Clean up partial download
-        callback(false, {error = "HTTP request failed: " .. tostring(result)})
+        callback(false, {error = "HTTPS request failed: " .. tostring(code)})
         return
     end
 

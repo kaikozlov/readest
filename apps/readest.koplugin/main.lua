@@ -252,8 +252,11 @@ function ReadestSync:getReadestStorageClient()
     end
 
     local ReadestStorageClient = require("readeststorage")
+    local spec_path = self.path .. "/readest-storage-api.json"
+    logger.warn("ReadestSync: storage spec path =", spec_path)
+
     return ReadestStorageClient:new{
-        service_spec = self.path .. "/readest-storage-api.json",
+        service_spec = spec_path,
         access_token = self.settings.access_token,
     }
 end
@@ -293,10 +296,10 @@ function ReadestSync:getBookMetadataFromFile(file_path, doc_settings)
             local normalized = {}
             local priorities = { "uuid", "calibre", "isbn" }
             local preferred = nil
-            for _, id in ipairs(list) do
+            for i, id in ipairs(list) do
                 table.insert(normalized, normalizeIdentifier(id))
                 local candidate = id:lower()
-                for _, p in ipairs(priorities) do
+                for j, p in ipairs(priorities) do
                     if candidate:find(p, 1, true) then
                         preferred = normalizeIdentifier(id)
                         break
@@ -377,7 +380,7 @@ function ReadestSync:getAnnotationsFromDocSettings(doc_settings, book_hash, meta
     local annotations = doc_settings:readSetting("annotations") or {}
     local notes = {}
 
-    for _, annotation in ipairs(annotations) do
+    for i, annotation in ipairs(annotations) do
         if annotation.drawer then
             local note_type = annotation.note and "annotation" or "highlight"
             local color = annotation.color
@@ -440,7 +443,7 @@ function ReadestSync:syncAllBooks(interactive)
     local all_configs = {}
     local processed = 0
 
-    for _, v in ipairs(ReadHistory.hist) do
+    for i, v in ipairs(ReadHistory.hist) do
         if v.dim then goto continue end
 
         local ok, doc_settings = pcall(function() return DocSettings:open(v.file) end)
@@ -455,7 +458,7 @@ function ReadestSync:syncAllBooks(interactive)
 
         if book_hash and meta_hash then
             local annotations = self:getAnnotationsFromDocSettings(doc_settings, book_hash, meta_hash)
-            for _, note in ipairs(annotations) do
+            for i, note in ipairs(annotations) do
                 table.insert(all_notes, note)
             end
 
@@ -522,9 +525,15 @@ function ReadestSync:showUploadBookList()
     local DocSettings = require("docsettings")
     local Menu = require("ui/widget/menu")
 
-    -- Build book list
+    -- Build book list (limit to 100 to prevent memory issues)
     local book_table = {}
-    for _, v in ipairs(ReadHistory.hist) do
+    local max_books = 100
+    local count = 0
+
+    for i, v in ipairs(ReadHistory.hist) do
+        if count >= max_books then
+            break
+        end
         if v.dim then goto continue end
 
         local ok, doc_settings = pcall(function() return DocSettings:open(v.file) end)
@@ -537,14 +546,18 @@ function ReadestSync:showUploadBookList()
         local authors = doc_props.authors or _("Unknown")
         local book_hash = doc_settings:readSetting("partial_md5_checksum")
 
+        -- Don't store doc_settings and doc_props - we'll reopen later if needed
         table.insert(book_table, {
             text = title .. " - " .. authors,
             filepath = v.file,
             book_hash = book_hash,
-            doc_settings = doc_settings,
-            doc_props = doc_props,
+            callback = function()
+                UIManager:close(menu)
+                self:uploadSingleBook(v.file, book_hash, title)
+            end
         })
 
+        count = count + 1
         ::continue::
     end
 
@@ -553,25 +566,109 @@ function ReadestSync:showUploadBookList()
         return
     end
 
-    -- Show menu
+    if count >= max_books then
+        UIManager:show(InfoMessage:new{
+            text = T(_("Showing first %1 books (library has more)"), max_books),
+            timeout = 2,
+        })
+    end
+
+    -- Show menu - each item has a callback to upload that book
     local menu = Menu:new{
-        title = _("Select books to upload"),
+        title = _("Tap a book to upload it"),
         item_table = book_table,
         is_borderless = true,
         is_popout = false,
-        select_mode = "multi",
-        callback = function()
-            local selected = menu:getMultiSelection()
-            if #selected > 0 then
-                UIManager:close(menu)
-                self:uploadSelectedBooks(selected)
-            end
-        end,
-        close_callback = function()
-            UIManager:close(menu)
-        end
     }
     UIManager:show(menu)
+end
+
+function ReadestSync:uploadSingleBook(filepath, book_hash, title)
+    UIManager:show(InfoMessage:new{
+        text = T(_("Starting upload: %1"), title),
+        timeout = 1,
+    })
+
+    if not book_hash then
+        UIManager:show(InfoMessage:new{ text = _("Book has no hash, skipping"), timeout = 2 })
+        return
+    end
+
+    UIManager:show(InfoMessage:new{
+        text = T(_("Uploading %1..."), title),
+        timeout = 1,
+    })
+
+    local client = self:getReadestStorageClient()
+    if not client then
+        UIManager:show(InfoMessage:new{ text = _("Failed to get storage client"), timeout = 2 })
+        return
+    end
+
+    UIManager:show(InfoMessage:new{ text = _("Got storage client, requesting upload URL..."), timeout = 1 })
+
+    self:tryRefreshToken()
+
+    -- Get file info
+    local file = io.open(filepath, "rb")
+    if not file then
+        UIManager:show(InfoMessage:new{ text = _("Failed to open file"), timeout = 2 })
+        return
+    end
+
+    local file_size = file:seek("end")
+    file:close()
+
+    local dir, filename = util.splitFilePathName(filepath)
+    -- Use the full path format expected by Readest: Readest/Books/{bookHash}/{filename}
+    local storage_path = "Readest/Books/" .. book_hash .. "/" .. filename
+
+    UIManager:show(InfoMessage:new{ text = T(_("Requesting upload URL for %1..."), filename), timeout = 1 })
+
+    -- Request upload URL
+    client:requestUpload({
+        fileName = storage_path,
+        fileSize = file_size,
+        bookHash = book_hash,
+    }, function(success, response)
+        UIManager:show(InfoMessage:new{ text = T(_("Upload response: success=%1"), tostring(success)), timeout = 1 })
+        if success and response and (response.uploadUrl or response.upload_url) then
+            -- Upload file directly to storage
+            local upload_url = response.uploadUrl or response.upload_url
+            UIManager:show(InfoMessage:new{
+                text = T(_("Uploading %1 (%2 MB)..."),
+                    title,
+                    string.format("%.1f", file_size / (1024 * 1024))),
+                timeout = 2,
+            })
+            client:uploadFileToUrl(upload_url, filepath, function(upload_ok, upload_res)
+                if upload_ok then
+                    UIManager:show(InfoMessage:new{
+                        text = T(_("Uploaded: %1"), title),
+                        timeout = 2,
+                    })
+                else
+                    UIManager:show(InfoMessage:new{
+                        text = T(_("Upload failed: %1"), title),
+                        timeout = 3,
+                    })
+                end
+            end)
+        else
+            local error_info = response
+            if type(response) == "table" then
+                error_info = response.error or response.message or "Unknown error"
+            elseif type(response) == "string" then
+                error_info = response
+            else
+                error_info = "Unknown error"
+            end
+            UIManager:show(InfoMessage:new{
+                text = T(_("Failed to get upload URL: %1"), error_info),
+                timeout = 3,
+            })
+        end
+    end)
 end
 
 function ReadestSync:uploadSelectedBooks(selections)
@@ -604,8 +701,7 @@ function ReadestSync:uploadSelectedBooks(selections)
         end
 
         local selection = selections[index]
-        local doc_settings = selection.doc_settings
-        local book_hash = doc_settings:readSetting("partial_md5_checksum")
+        local book_hash = selection.book_hash
 
         if not book_hash then
             logger.warn("ReadestSync: Book has no hash, skipping:", selection.filepath)
@@ -632,10 +728,12 @@ function ReadestSync:uploadSelectedBooks(selections)
         file:close()
 
         local dir, filename = util.splitFilePathName(selection.filepath)
+        -- Use the full path format expected by Readest: Readest/Books/{bookHash}/{filename}
+        local storage_path = "Readest/Books/" .. book_hash .. "/" .. filename
 
         -- Request upload URL
         client:requestUpload({
-            fileName = filename,
+            fileName = storage_path,
             fileSize = file_size,
             bookHash = book_hash,
         }, function(success, response)
@@ -718,7 +816,7 @@ function ReadestSync:showDownloadSelection(files)
 
     -- Build file list
     local file_table = {}
-    for _, file in ipairs(files) do
+    for i, file in ipairs(files) do
         local fileKey = file.file_key or file.fileKey
         if not fileKey then
             logger.warn("ReadestSync: Skipping file without file_key:", file)
@@ -811,7 +909,7 @@ function ReadestSync:downloadSelectedBooks(selections, download_dir)
     local conflicts = {}
     local no_conflicts = {}
 
-    for _, selection in ipairs(selections) do
+    for i, selection in ipairs(selections) do
         if selection.local_exists and selection.local_hash ~= selection.book_hash then
             table.insert(conflicts, selection)
         else
@@ -982,9 +1080,11 @@ function ReadestSync:uploadCoverForBook(book_hash, doc_settings)
     file:close()
 
     local filename = "cover_" .. book_hash .. ".png"
+    -- Use the full path format expected by Readest: Readest/Books/{bookHash}/{filename}
+    local storage_path = "Readest/Books/" .. book_hash .. "/" .. filename
 
     client:requestUpload({
-        fileName = filename,
+        fileName = storage_path,
         fileSize = file_size,
         bookHash = book_hash,
         temp = false,
@@ -1110,7 +1210,7 @@ function ReadestSync:showDeleteSelection(files)
 
     -- Build file list
     local file_table = {}
-    for _, file in ipairs(files) do
+    for i, file in ipairs(files) do
         local fileKey = file.file_key or file.fileKey
         if not fileKey then
             logger.warn("ReadestSync: Skipping file without file_key:", file)
@@ -1457,7 +1557,7 @@ function ReadestSync:generateMetadataHash()
         for i, id in ipairs(list) do
             normalized[i] = normalizeIdentifier(id)
             local candidate = id:lower()
-            for _, p in ipairs(priorities) do
+            for j, p in ipairs(priorities) do
                 if candidate:find(p, 1, true) then
                     preferred = normalized[i]
                     break
@@ -1554,7 +1654,7 @@ function ReadestSync:getCurrentBookNotes()
     local meta_hash = self:getMetaHash()
     local notes = {}
 
-    for _, annotation in ipairs(self.ui.annotation.annotations) do
+    for i, annotation in ipairs(self.ui.annotation.annotations) do
         -- Skip bookmarks (no drawer = not a highlight)
         if not annotation.drawer then
             goto continue
@@ -1606,10 +1706,10 @@ function ReadestSync:applyNotesToBook(notes)
     local current_annotations = self.ui.annotation.annotations
     local notes_to_add = {}
 
-    for _, remote_note in ipairs(notes) do
+    for i, remote_note in ipairs(notes) do
         -- Check if note already exists
         local exists = false
-        for _, local_ann in ipairs(current_annotations) do
+        for j, local_ann in ipairs(current_annotations) do
             local local_id = self:generateNoteId(local_ann)
             if local_id == remote_note.id then
                 exists = true
@@ -1639,7 +1739,7 @@ function ReadestSync:applyNotesToBook(notes)
         end
     end
 
-    for _, annotation in ipairs(notes_to_add) do
+    for i, annotation in ipairs(notes_to_add) do
         self.ui.annotation:addItem(annotation)
     end
 
