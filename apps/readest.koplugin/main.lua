@@ -329,12 +329,18 @@ function ReadestSync:getBookMetadataFromFile(file_path, doc_settings)
     elseif status == "abandoned" then status = "abandoned"
     else status = "reading" end
 
+    -- ALWAYS use filename extension for format (doc_props can be wrong)
+    local dir, filename = util.splitFilePathName(file_path)
+    local format = getFormatFromFilename(filename)
+
     return {
         userId = self.settings.user_id,
         hash = book_hash,
         metaHash = meta_hash,
-        format = doc_props.document_format or "unknown",
+        format = format,
         title = doc_props.title or "",
+        sourceTitle = doc_props.title or "",
+        primaryLanguage = doc_props.language or "en",
         author = author_list[1] or "",
         groupId = nil,
         groupName = nil,
@@ -546,6 +552,21 @@ function ReadestSync:showUploadBookList()
         local authors = doc_props.authors or _("Unknown")
         local book_hash = doc_settings:readSetting("partial_md5_checksum")
 
+        -- IMPORTANT: Get the original file path from doc_path setting
+        -- v.file from ReadHistory may point to sidecar directory (HTML), not original file
+        local original_filepath = doc_settings:readSetting("doc_path") or v.file
+
+        -- Validate format - Readest only supports specific formats
+        local format = getFormatFromFilename(original_filepath)
+        local supported_formats = {
+            PDF = true, EPUB = true, MOBI = true, AZW = true, AZW3 = true,
+            CBZ = true, FB2 = true, FBZ = true, TXT = true, MD = true,
+        }
+        if not supported_formats[format] then
+            logger.dbg("ReadestSync: Skipping unsupported format:", format, "for", title)
+            goto continue
+        end
+
         -- Don't store doc_settings and doc_props - we'll reopen later if needed
         table.insert(book_table, {
             text = title .. " - " .. authors,
@@ -553,7 +574,7 @@ function ReadestSync:showUploadBookList()
             book_hash = book_hash,
             callback = function()
                 UIManager:close(menu)
-                self:uploadSingleBook(v.file, book_hash, title)
+                self:uploadSingleBook(original_filepath, book_hash, title)
             end
         })
 
@@ -562,7 +583,10 @@ function ReadestSync:showUploadBookList()
     end
 
     if #book_table == 0 then
-        UIManager:show(InfoMessage:new{ text = _("No books found in library"), timeout = 2 })
+        UIManager:show(InfoMessage:new{
+            text = _("No supported books found in library\n\nReadest supports: PDF, EPUB, MOBI, AZW, AZW3, CBZ, FB2, FBZ, TXT, MD"),
+            timeout = 4,
+        })
         return
     end
 
@@ -594,6 +618,20 @@ function ReadestSync:uploadSingleBook(filepath, book_hash, title)
         return
     end
 
+    -- Validate format - Readest only supports specific formats
+    local format = getFormatFromFilename(filepath)
+    local supported_formats = {
+        PDF = true, EPUB = true, MOBI = true, AZW = true, AZW3 = true,
+        CBZ = true, FB2 = true, FBZ = true, TXT = true, MD = true,
+    }
+    if not supported_formats[format] then
+        UIManager:show(InfoMessage:new{
+            text = T(_("Unsupported format: %1\n\nReadest supports: PDF, EPUB, MOBI, AZW, AZW3, CBZ, FB2, FBZ, TXT, MD"), format),
+            timeout = 3,
+        })
+        return
+    end
+
     UIManager:show(InfoMessage:new{
         text = T(_("Uploading %1..."), title),
         timeout = 1,
@@ -609,7 +647,22 @@ function ReadestSync:uploadSingleBook(filepath, book_hash, title)
 
     self:tryRefreshToken()
 
-    -- Get file info
+    -- IMPORTANT: First, check if filepath points to sidecar file and use original path
+    -- This must be done BEFORE calculating file size since we need the correct file
+    local DocSettings = require("docsettings")
+    local ok, doc_settings = pcall(function() return DocSettings:open(filepath) end)
+
+    if ok and doc_settings then
+        local original_filepath = doc_settings:readSetting("doc_path")
+        if original_filepath and original_filepath ~= filepath then
+            logger.warn("ReadestSync: Using original file path from doc_path:", original_filepath)
+            filepath = original_filepath
+            -- Reopen DocSettings with the correct path
+            ok, doc_settings = pcall(function() return DocSettings:open(filepath) end)
+        end
+    end
+
+    -- Get file info (with potentially corrected filepath)
     local file = io.open(filepath, "rb")
     if not file then
         UIManager:show(InfoMessage:new{ text = _("Failed to open file"), timeout = 2 })
@@ -620,8 +673,33 @@ function ReadestSync:uploadSingleBook(filepath, book_hash, title)
     file:close()
 
     local dir, filename = util.splitFilePathName(filepath)
-    -- Use the full path format expected by Readest: Readest/Books/{bookHash}/{filename}
-    local storage_path = "Readest/Books/" .. book_hash .. "/" .. filename
+    -- Get the book metadata to construct the storage filename
+    -- Web app expects: Readest/Books/{bookHash}/{sanitizedTitle}.{ext}
+    local storage_filename = filename  -- fallback to local filename
+    local book_title = nil
+    local book_format_upper = nil  -- format for metadata (uppercase)
+    local book_format_lower = nil  -- format for file extension (lowercase)
+
+    if ok and doc_settings then
+        local doc_props = doc_settings:readSetting("doc_props")
+        if doc_props then
+            book_title = doc_props.title or ""
+        end
+    end
+
+    -- Fallback if we couldn't get title from doc_props
+    if not book_title or book_title == "" then
+        local basename, _ = util.splitFileNameSuffix(filename)
+        book_title = basename
+    end
+
+    -- ALWAYS use filename extension for format (doc_props can be wrong)
+    book_format_upper = getFormatFromFilename(filename)
+    book_format_lower = string.lower(book_format_upper)
+
+    storage_filename = sanitizeForFilename(book_title) .. "." .. book_format_lower
+    -- Use the full path format expected by Readest: Readest/Books/{bookHash}/{sanitizedTitle}.{ext}
+    local storage_path = "Readest/Books/" .. book_hash .. "/" .. storage_filename
 
     UIManager:show(InfoMessage:new{ text = T(_("Requesting upload URL for %1..."), filename), timeout = 1 })
 
@@ -642,7 +720,52 @@ function ReadestSync:uploadSingleBook(filepath, book_hash, title)
                 timeout = 2,
             })
             client:uploadFileToUrl(upload_url, filepath, function(upload_ok, upload_res)
+                logger.warn("ReadestSync: Upload callback called - upload_ok:", upload_ok)
                 if upload_ok then
+                    -- After file upload succeeds, sync book metadata to database
+                    logger.warn("ReadestSync: Getting metadata for sync...")
+                    local DocSettings = require("docsettings")
+                    local ok, doc_settings = pcall(function() return DocSettings:open(filepath) end)
+                    logger.warn("ReadestSync: DocSettings open result:", ok)
+                    if ok and doc_settings then
+                        local metadata = self:getBookMetadataFromFile(filepath, doc_settings)
+                        logger.warn("ReadestSync: Got metadata, format:", metadata.format or "nil")
+                        if metadata then
+                            metadata.uploadedAt = os.time() * 1000
+                            metadata.downloadedAt = os.time() * 1000
+                            local sync_client = self:getReadestSyncClient()
+                            logger.warn("ReadestSync: Got sync client:", sync_client ~= nil)
+                            if sync_client then
+                                logger.warn("ReadestSync: Pushing changes to server...")
+                                sync_client:pushChanges({
+                                    books = { metadata },
+                                    notes = {},
+                                    configs = {}
+                                }, function(sync_ok, sync_res)
+                                    logger.warn("ReadestSync: Sync callback - sync_ok:", sync_ok)
+                                    if sync_ok then
+                                        UIManager:show(InfoMessage:new{
+                                            text = T(_("Uploaded: %1"), title),
+                                            timeout = 2,
+                                        })
+                                    else
+                                        UIManager:show(InfoMessage:new{
+                                            text = T(_("File uploaded but metadata sync failed: %1"), title),
+                                            timeout = 3,
+                                        })
+                                        logger.err("ReadestSync: Metadata sync failed:", sync_res)
+                                    end
+                                end)
+                                return
+                            else
+                                logger.err("ReadestSync: Failed to get sync client")
+                            end
+                        else
+                            logger.err("ReadestSync: Failed to get metadata from doc_settings")
+                        end
+                    else
+                        logger.err("ReadestSync: Failed to open DocSettings:", filepath)
+                    end
                     UIManager:show(InfoMessage:new{
                         text = T(_("Uploaded: %1"), title),
                         timeout = 2,
@@ -715,10 +838,26 @@ function ReadestSync:uploadSelectedBooks(selections)
             timeout = 1,
         })
 
-        -- Get file info
-        local file = io.open(selection.filepath, "rb")
+        -- IMPORTANT: First, check if filepath points to sidecar file and use original path
+        -- This must be done BEFORE calculating file size since we need the correct file
+        local DocSettings = require("docsettings")
+        local filepath = selection.filepath  -- Use local variable for potential correction
+        local ok, doc_settings = pcall(function() return DocSettings:open(filepath) end)
+
+        if ok and doc_settings then
+            local original_filepath = doc_settings:readSetting("doc_path")
+            if original_filepath and original_filepath ~= filepath then
+                logger.warn("ReadestSync: Using original file path from doc_path:", original_filepath)
+                filepath = original_filepath
+                -- Reopen DocSettings with the correct path
+                ok, doc_settings = pcall(function() return DocSettings:open(filepath) end)
+            end
+        end
+
+        -- Get file info (with potentially corrected filepath)
+        local file = io.open(filepath, "rb")
         if not file then
-            logger.warn("ReadestSync: Failed to open file:", selection.filepath)
+            logger.warn("ReadestSync: Failed to open file:", filepath)
             fail_count = fail_count + 1
             UIManager:scheduleIn(0.1, uploadNext)
             return
@@ -727,9 +866,34 @@ function ReadestSync:uploadSelectedBooks(selections)
         local file_size = file:seek("end")
         file:close()
 
-        local dir, filename = util.splitFilePathName(selection.filepath)
-        -- Use the full path format expected by Readest: Readest/Books/{bookHash}/{filename}
-        local storage_path = "Readest/Books/" .. book_hash .. "/" .. filename
+        local dir, filename = util.splitFilePathName(filepath)
+        -- Get the book metadata to construct the storage filename
+        -- Web app expects: Readest/Books/{bookHash}/{sanitizedTitle}.{ext}
+        local storage_filename = filename  -- fallback to local filename
+        local book_title = nil
+        local book_format_upper = nil  -- format for metadata (uppercase)
+        local book_format_lower = nil  -- format for file extension (lowercase)
+
+        if ok and doc_settings then
+            local doc_props = doc_settings:readSetting("doc_props")
+            if doc_props then
+                book_title = doc_props.title or ""
+            end
+        end
+
+        -- Fallback if we couldn't get title from doc_props
+        if not book_title or book_title == "" then
+            local basename, _ = util.splitFileNameSuffix(filename)
+            book_title = basename
+        end
+
+        -- ALWAYS use filename extension for format (doc_props can be wrong)
+        book_format_upper = getFormatFromFilename(filename)
+        book_format_lower = string.lower(book_format_upper)
+
+        storage_filename = sanitizeForFilename(book_title) .. "." .. book_format_lower
+        -- Use the full path format expected by Readest: Readest/Books/{bookHash}/{sanitizedTitle}.{ext}
+        local storage_path = "Readest/Books/" .. book_hash .. "/" .. storage_filename
 
         -- Request upload URL
         client:requestUpload({
@@ -740,13 +904,41 @@ function ReadestSync:uploadSelectedBooks(selections)
             if success and response and (response.uploadUrl or response.upload_url) then
                 -- Upload file directly to storage
                 local upload_url = response.uploadUrl or response.upload_url
-                client:uploadFileToUrl(upload_url, selection.filepath, function(upload_ok, upload_res)
+                client:uploadFileToUrl(upload_url, filepath, function(upload_ok, upload_res)
                     if upload_ok then
+                        -- After file upload succeeds, sync book metadata to database
+                        local DocSettings = require("docsettings")
+                        local ok, doc_settings = pcall(function() return DocSettings:open(filepath) end)
+                        if ok and doc_settings then
+                            local metadata = self:getBookMetadataFromFile(filepath, doc_settings)
+                            if metadata then
+                                metadata.uploadedAt = os.time() * 1000
+                                metadata.downloadedAt = os.time() * 1000
+                                local sync_client = self:getReadestSyncClient()
+                                if sync_client then
+                                    sync_client:pushChanges({
+                                        books = { metadata },
+                                        notes = {},
+                                        configs = {}
+                                    }, function(sync_ok, sync_res)
+                                        if sync_ok then
+                                            success_count = success_count + 1
+                                            logger.dbg("ReadestSync: Uploaded and synced:", filepath)
+                                        else
+                                            logger.err("ReadestSync: File uploaded but metadata sync failed:", filepath, sync_res)
+                                            success_count = success_count + 1  -- Still count as success since file is uploaded
+                                        end
+                                        UIManager:scheduleIn(0.1, uploadNext)
+                                    end)
+                                    return
+                                end
+                            end
+                        end
                         success_count = success_count + 1
-                        logger.dbg("ReadestSync: Uploaded:", selection.filepath)
+                        logger.dbg("ReadestSync: Uploaded:", filepath)
                     else
                         fail_count = fail_count + 1
-                        logger.err("ReadestSync: Upload failed:", selection.filepath, upload_res)
+                        logger.err("ReadestSync: Upload failed:", filepath, upload_res)
                     end
                     UIManager:scheduleIn(0.1, uploadNext)
                 end)
@@ -1526,6 +1718,41 @@ function normalizeAuthor(author)
     -- Trim leading and trailing whitespace
     author = author:gsub("^%s*(.-)%s*$", "%1")
     return author
+end
+
+-- Sanitize filename for cloud storage (URL-safe)
+function sanitizeForFilename(title)
+    -- Replace characters that are not URL-safe with underscores
+    -- Keep: letters, digits, hyphens, underscores, spaces, periods, commas, parentheses
+    local sanitized = title:gsub("[^%w%s%-%_%.%%(%)%,]+", "_")
+    -- Replace multiple consecutive spaces/underscores with single underscore
+    sanitized = sanitized:gsub("[%s_]+", "_")
+    -- Trim leading/trailing underscores
+    sanitized = sanitized:gsub("^_+", ""):gsub("_+$", "")
+    return sanitized
+end
+
+-- Get format from filename extension as fallback
+function getFormatFromFilename(filename)
+    local ext = filename:match("%.([%w%d]+)$")
+    if not ext then return "pdf" end
+    ext = string.lower(ext)
+    -- Map common extensions to Readest format names
+    local format_map = {
+        pdf = "PDF",
+        epub = "EPUB",
+        mobi = "MOBI",
+        azw = "AZW",
+        azw3 = "AZW3",
+        cbz = "CBZ",
+        fb2 = "FB2",
+        fbz = "FBZ",
+        txt = "TXT",
+        html = "HTML",
+        htm = "HTML",
+        xhtml = "XHTML",
+    }
+    return format_map[ext] or string.upper(ext)
 end
 
 function ReadestSync:generateMetadataHash()
